@@ -471,5 +471,6 @@ then
   CFLAGS="$CFLAGS -errfmt=error -errwarn -errshort=tags"
 fi
 
+CPPFLAGS="-I\${top_srcdir}/include ${CPPFLAGS}"
 AC_CONFIG_FILES(Makefile doc/Makefile)
 AC_OUTPUT
