@@ -147,7 +147,7 @@ hash_item *do_item_alloc(const void *key, const size_t nkey, const int flags, co
                         itemstats[id].evicted_nonzero++;
                     }
                     STATS_LOCK();
-                    stats.evictions++;
+                    default_engine.stats.evictions++;
                     STATS_UNLOCK();
                 }
                 do_item_unlink(search);
@@ -277,9 +277,9 @@ int do_item_link(hash_item *it) {
     assoc_insert(it);
 
     STATS_LOCK();
-    stats.curr_bytes += ITEM_ntotal(it);
-    stats.curr_items += 1;
-    stats.total_items += 1;
+    default_engine.stats.curr_bytes += ITEM_ntotal(it);
+    default_engine.stats.curr_items += 1;
+    default_engine.stats.total_items += 1;
     STATS_UNLOCK();
 
     /* Allocate a new CAS ID on link. */
@@ -295,8 +295,8 @@ void do_item_unlink(hash_item *it) {
     if ((it->item.iflag & ITEM_LINKED) != 0) {
         it->item.iflag &= ~ITEM_LINKED;
         STATS_LOCK();
-        stats.curr_bytes -= ITEM_ntotal(it);
-        stats.curr_items -= 1;
+        default_engine.stats.curr_bytes -= ITEM_ntotal(it);
+        default_engine.stats.curr_items -= 1;
         STATS_UNLOCK();
         assoc_delete(ITEM_key(&it->item), it->item.nkey);
         item_unlink_q(it);
