@@ -312,8 +312,8 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
         if (!stat_type) {
             /* prepare general statistics for the engine */
             APPEND_STAT("bytes", "%"PRIu64, default_engine.stats.curr_bytes);
-            APPEND_STAT("curr_items", "%u", default_engine.stats.curr_items);
-            APPEND_STAT("total_items", "%u", default_engine.stats.total_items);
+            APPEND_STAT("curr_items", "%u"PRIu64, default_engine.stats.curr_items);
+            APPEND_STAT("total_items", "%u"PRIu64, default_engine.stats.total_items);
             APPEND_STAT("evictions", "%"PRIu64, default_engine.stats.evictions);
         } else if (nz_strcmp(nkey, stat_type, "items") == 0) {
             item_stats(add_stats, c);
