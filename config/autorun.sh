@@ -13,8 +13,8 @@ ARGV0=$0
 ARGS="$@"
 
 run() {
-	echo "$ARGV0: running \`$@' $ARGS"
-	$@ $ARGS
+  echo "$ARGV0: running \`$@' $ARGS"
+  $@ $ARGS
 }
 
 # Try to locate a program by using which, and verify that the file is an
