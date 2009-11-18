@@ -1,5 +1,5 @@
 AC_PREREQ(2.52)
-m4_include([version.m4])
+m4_include([m4/version.m4])
 AC_INIT(memcached, VERSION_NUMBER, brad@danga.com)
 AC_CANONICAL_SYSTEM
 AC_CONFIG_SRCDIR(memcached.c)
