@@ -178,14 +178,14 @@ static void stats_init(void) {
     stats_prefix_init();
 }
 
-static void stats_reset(void) {
+static void stats_reset(const void *cookie) {
     STATS_LOCK();
     stats.total_conns = 0;
     stats.listen_disabled_num = 0;
     stats_prefix_clear();
     STATS_UNLOCK();
     threadlocal_stats_reset();
-    settings.engine.v1->reset_stats(settings.engine.v0);
+    settings.engine.v1->reset_stats(settings.engine.v0, cookie);
 }
 
 static void settings_init(void) {
@@ -460,13 +460,13 @@ static void conn_cleanup(conn *c) {
     assert(c != NULL);
 
     if (c->item) {
-        settings.engine.v1->release(settings.engine.v0, c->item);
+        settings.engine.v1->release(settings.engine.v0, c, c->item);
         c->item = 0;
     }
 
     if (c->ileft != 0) {
         for (; c->ileft > 0; c->ileft--,c->icurr++) {
-            settings.engine.v1->release(settings.engine.v0, *(c->icurr));
+            settings.engine.v1->release(settings.engine.v0, c, *(c->icurr));
         }
     }
 
@@ -861,7 +861,8 @@ static void complete_nread_ascii(conn *c) {
         }
     }
 
-    settings.engine.v1->release(settings.engine.v0, c->item);       /* release the c->item reference */
+    /* release the c->item reference */
+    settings.engine.v1->release(settings.engine.v0, c, c->item);
     c->item = 0;
 }
 
@@ -1139,7 +1140,8 @@ static void complete_update_bin(conn *c) {
         write_bin_error(c, eno, 0);
     }
 
-    settings.engine.v1->release(settings.engine.v0, c->item);       /* release the c->item reference */
+    /* release the c->item reference */
+    settings.engine.v1->release(settings.engine.v0, c, c->item);
     c->item = 0;
 }
 
@@ -1347,8 +1349,8 @@ static void process_bin_stat(conn *c) {
         server_stats(&append_stats, c);
         settings.engine.v1->get_stats(settings.engine.v0, c, NULL, 0, append_stats);
     } else if (strncmp(subcommand, "reset", 5) == 0) {
-        stats_reset();
-        settings.engine.v1->reset_stats(settings.engine.v0);
+        stats_reset(c);
+        settings.engine.v1->reset_stats(settings.engine.v0, c);
     } else if (strncmp(subcommand, "settings", 8) == 0) {
         process_stat_settings(&append_stats, c);
     } else if (strncmp(subcommand, "detail", 6) == 0) {
@@ -1598,7 +1600,7 @@ static void process_bin_complete_sasl_auth(conn *c) {
     }
 
     settings.engine.v1->remove(settings.engine.v0, c, c->item);
-    settings.engine.v1->release(settings.engine.v0, c->item);
+    settings.engine.v1->release(settings.engine.v0, c, c->item);
 
     if (settings.verbose) {
         fprintf(stderr, "sasl result code:  %d\n", result);
@@ -1902,7 +1904,7 @@ static void process_bin_update(conn *c) {
         if (c->cmd == PROTOCOL_BINARY_CMD_SET) {
             if (settings.engine.v1->get(settings.engine.v0, c, &it, key, nkey) == ENGINE_SUCCESS) {
                 settings.engine.v1->remove(settings.engine.v0, c, it);
-                settings.engine.v1->release(settings.engine.v0, it);
+                settings.engine.v1->release(settings.engine.v0, c, it);
             }
         }
 
@@ -2014,7 +2016,8 @@ static void process_bin_delete(conn *c) {
         } else {
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS, 0);
         }
-        settings.engine.v1->release(settings.engine.v0, it);      /* release our reference */
+        /* release our reference */
+        settings.engine.v1->release(settings.engine.v0, c, it);
     } else {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, 0);
     }
@@ -2067,7 +2070,7 @@ static void reset_cmd_handler(conn *c) {
     c->cmd = -1;
     c->substate = bin_no_state;
     if(c->item != NULL) {
-        settings.engine.v1->release(settings.engine.v0, c->item);
+        settings.engine.v1->release(settings.engine.v0, c, c->item);
         c->item = NULL;
     }
     conn_shrink(c);
@@ -2326,7 +2329,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         (void)settings.engine.v1->get_stats(settings.engine.v0, c,
                                             NULL, 0, &append_stats);
     } else if (strcmp(subcommand, "reset") == 0) {
-        stats_reset();
+        stats_reset(c);
         out_string(c, "RESET");
         return ;
     } else if (strcmp(subcommand, "detail") == 0) {
@@ -2433,7 +2436,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                         c->isize *= 2;
                         c->ilist = new_list;
                     } else {
-                        settings.engine.v1->release(settings.engine.v0, it);
+                        settings.engine.v1->release(settings.engine.v0, c, it);
                         break;
                     }
                 }
@@ -2447,7 +2450,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                         c->suffixsize *= 2;
                         c->suffixlist  = new_suffix_list;
                     } else {
-                        settings.engine.v1->release(settings.engine.v0, it);
+                        settings.engine.v1->release(settings.engine.v0, c, it);
                         break;
                     }
                 }
@@ -2456,7 +2459,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 char *suffix = cache_alloc(c->thread->suffix_cache);
                 if (suffix == NULL) {
                     out_string(c, "SERVER_ERROR out of memory rebuilding suffix");
-                    settings.engine.v1->release(settings.engine.v0, it);
+                    settings.engine.v1->release(settings.engine.v0, c, it);
                     return;
                 }
                 *(c->suffixlist + i) = suffix;
@@ -2481,7 +2484,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                   char *cas = cache_alloc(c->thread->suffix_cache);
                   if (cas == NULL) {
                     out_string(c, "SERVER_ERROR out of memory making CAS suffix");
-                    settings.engine.v1->release(settings.engine.v0, it);
+                    settings.engine.v1->release(settings.engine.v0, c, it);
                     return;
                   }
                   *(c->suffixlist + i) = cas;
@@ -2494,7 +2497,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       add_iov(c, cas, cas_len) != 0 ||
                       add_iov(c, settings.engine.v1->item_get_data(it), it->nbytes) != 0)
                       {
-                          settings.engine.v1->release(settings.engine.v0, it);
+                          settings.engine.v1->release(settings.engine.v0, c, it);
                           break;
                       }
                 }
@@ -2507,7 +2510,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       add_iov(c, suffix, suffix_len) != 0 ||
                       add_iov(c, settings.engine.v1->item_get_data(it), it->nbytes) != 0)
                       {
-                          settings.engine.v1->release(settings.engine.v0, it);
+                          settings.engine.v1->release(settings.engine.v0, c, it);
                           break;
                       }
                 }
@@ -2651,7 +2654,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
             if (settings.engine.v1->get(settings.engine.v0, c, &it,
                                         key, nkey) == ENGINE_SUCCESS) {
                 settings.engine.v1->remove(settings.engine.v0, c, it);
-                settings.engine.v1->release(settings.engine.v0, it);
+                settings.engine.v1->release(settings.engine.v0, c, it);
             }
         }
     }
@@ -2759,7 +2762,8 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         settings.engine.v1->remove(settings.engine.v0, c, it);
-        settings.engine.v1->release(settings.engine.v0, it);      /* release our reference */
+        /* release our reference */
+        settings.engine.v1->release(settings.engine.v0, c, it);
         out_string(c, "DELETED");
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -3489,7 +3493,7 @@ static void drive_machine(conn *c) {
                 if (c->state == conn_mwrite) {
                     while (c->ileft > 0) {
                         item *it = *(c->icurr);
-                        settings.engine.v1->release(settings.engine.v0, it);
+                        settings.engine.v1->release(settings.engine.v0, c, it);
                         c->icurr++;
                         c->ileft--;
                     }
