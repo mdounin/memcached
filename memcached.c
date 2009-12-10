@@ -141,6 +141,16 @@ static enum transmit_result transmit(conn *c);
 #define REALTIME_MAXDELTA 60*60*24*30
 
 
+// Perform all callbacks of a given type for the given connection.
+static inline void perform_callbacks(ENGINE_EVENT_TYPE type,
+                                     const void *data,
+                                     conn *c) {
+    for (struct engine_event_handler *h = engine_event_handlers[type];
+         h; h = h->next) {
+        h->cb(c, type, data, h->cb_data);
+    }
+}
+
 /*
  * given time value that's either unix time or delta from current unix time,
  * return unix time. Use the fact that delta can't exceed one month
@@ -455,6 +465,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     MEMCACHED_CONN_ALLOCATE(c->sfd);
 
+    perform_callbacks(ON_CONNECT, NULL, c);
+
     return c;
 }
 
@@ -524,6 +536,8 @@ static void conn_close(conn *c) {
 
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
+
+    perform_callbacks(ON_DISCONNECT, NULL, c);
 
     MEMCACHED_CONN_RELEASE(c->sfd);
     close(c->sfd);
@@ -1626,6 +1640,9 @@ static void process_bin_complete_sasl_auth(conn *c) {
     switch(result) {
     case SASL_OK:
         write_bin_response(c, "Authenticated", 0, 0, strlen("Authenticated"));
+        const void *uname = NULL;
+        sasl_getprop(c->sasl_conn, SASL_USERNAME, &uname);
+        perform_callbacks(ON_AUTH, uname, c);
         break;
     case SASL_CONTINUE:
         add_bin_header(c, PROTOCOL_BINARY_RESPONSE_AUTH_CONTINUE, 0, 0, outlen);
