@@ -1,6 +1,9 @@
 bin_PROGRAMS = memcached memcached-debug
 
 memcached_SOURCES = memcached.c slabs.c slabs.h items.c items.h assoc.c assoc.h memcached.h thread.c stats.c stats.h
+if ENABLE_REPLICATION
+memcached_SOURCES += replication.h replication.c
+endif
 memcached_debug_SOURCES = $(memcached_SOURCES)
 memcached_CPPFLAGS = -DNDEBUG
 memcached_LDADD = @LIBOBJS@

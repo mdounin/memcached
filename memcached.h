@@ -79,6 +79,11 @@ struct settings {
     int num_threads;        /* number of libevent threads to run */
     char prefix_delimiter;  /* character that marks a key prefix (for stats) */
     int detail_enabled;     /* nonzero if we're collecting detailed stats */
+#ifdef USE_REPLICATION
+    struct in_addr rep_addr;    /* replication addr */
+    int rep_port;               /* replication port */
+    int rep_mode;               /* Master/Backup    */
+#endif
 };
 
 extern struct stats stats;
@@ -122,7 +127,16 @@ enum conn_states {
     conn_nread,      /* reading in a fixed number of bytes */
     conn_swallow,    /* swallowing unnecessary bytes w/o storing */
     conn_closing,    /* closing this connection */
+#ifdef USE_REPLICATION
+    conn_mwrite,     /* writing out many items sequentially */
+    conn_repconnect, /* replication */
+    conn_pipe_recv,  /* */
+    conn_pipe_send,  /* */
+    conn_rep_recv,   /* */
+    conn_rep_send    /* */
+#else
     conn_mwrite      /* writing out many items sequentially */
+#endif /* USE_REPLICATION */
 };
 
 #define NREAD_ADD 1
@@ -223,6 +237,9 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags, const
 #include "assoc.h"
 #include "items.h"
 
+#ifdef USE_REPLICATION
+#include "replication.h"
+#endif /* USE_REPLICATION */
 
 /*
  * In multithreaded mode, we wrap certain functions with lock management and

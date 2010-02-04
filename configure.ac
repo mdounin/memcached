@@ -166,6 +166,17 @@ AC_ARG_ENABLE(threads,
     AC_MSG_ERROR([Can't enable threads without the POSIX thread library.])
    fi])
 
+dnl Check whether the user wants replication or not
+AC_ARG_ENABLE(replication,
+  [AS_HELP_STRING([--enable-replication],[support replication])],
+  [if test "x$enable_threads" = "xyes"; then
+     AC_MSG_ERROR([Can't enable threads and replication together.])
+   else
+     AC_DEFINE([USE_REPLICATION],,[Define this if you want to use replication])
+   fi
+  ])
+AM_CONDITIONAL(ENABLE_REPLICATION, test "x$enable_replication" = "xyes")
+
 AC_CHECK_FUNCS(mlockall)
 
 AC_CONFIG_FILES(Makefile doc/Makefile)

@@ -615,3 +615,52 @@ void assoc_delete(const char *key, const size_t nkey) {
        they can't find. */
     assert(*before != 0);
 }
+
+#ifdef USE_REPLICATION
+char *assoc_key_snap(int *n)
+{
+    char *p = NULL;
+    char *b = NULL;
+    item *i = NULL;
+    int  co = 0;
+    int  sz = 1;
+    int  hs = 0;
+    int  hm = hashsize(hashpower);
+
+    hs = hm;
+    while(hs--){
+        if(expanding && hs < hashsize(hashpower - 1) && hs >= expand_bucket){
+            i = old_hashtable[hs];
+        }else{
+            i = primary_hashtable[hs];
+        }
+        while(i){
+            sz += i->nkey + 1;
+            co++;
+            i = i->h_next;
+        }
+    }
+
+    if(co){
+        if(p = b = malloc(sz)){
+            hs = hm;
+            while(hs--){
+                if(expanding && hs < hashsize(hashpower - 1) && hs >= expand_bucket){
+                    i = old_hashtable[hs];
+                }else{
+                    i = primary_hashtable[hs];
+                }
+                while(i){
+                    memcpy(p, ITEM_key(i), i->nkey);
+                    p += i->nkey;
+                    *(p++) = 0;
+                    i = i->h_next;
+                }
+            }
+            *(p++) = 0;
+        }
+    }
+    if(n) *n = co;
+    return(b);
+}
+#endif /* USE_REPLICATION */

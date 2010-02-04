@@ -99,6 +99,27 @@ static void set_current_time(void);  /* update the global variable holding
 void pre_gdb(void);
 static void conn_free(conn *c);
 
+#ifdef USE_REPLICATION
+static int   rep_exit = 0;
+static char *rep_rs[] = {"STORED\r\n", "DELETED\r\n", "NOT_FOUND\r\n", "OK\r\n", NULL};
+static conn *rep_recv = NULL;
+static conn *rep_send = NULL;
+static conn *rep_conn = NULL;
+static int replication_master_init();
+static int replication_backup_init();
+static int replication_init();
+static int replication_connect();
+static int replication_close();
+static int replication_marugoto(int);
+static int replication_recv(conn *);
+static int replication_send(conn *);
+static int replication_pop();
+static int replication_push();
+static int replication_exit();
+static int replication_item(Q_ITEM *);
+int replication(enum CMD_TYPE type, R_CMD *cmd);
+#endif /* USE_REPLICATION */
+
 /** exported globals **/
 struct stats stats;
 struct settings settings;
@@ -185,6 +206,11 @@ static void settings_init(void) {
 #endif
     settings.prefix_delimiter = ':';
     settings.detail_enabled = 0;
+#ifdef USE_REPLICATION
+    settings.rep_addr.s_addr = htonl(INADDR_ANY);
+    settings.rep_port = 11212;
+    settings.rep_mode = REP_MASTER;
+#endif /* USE_REPLICATION */
 }
 
 /* returns true if a deleted item's delete-locked-time is over, and it
@@ -340,6 +366,13 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
             fprintf(stderr, "<%d server listening\n", sfd);
         else if (is_udp)
             fprintf(stderr, "<%d server listening (udp)\n", sfd);
+#ifdef USE_REPLICATION
+        else if (init_state == conn_repconnect)
+            if(settings.rep_mode == REP_MASTER)
+                fprintf(stderr, "<%d server listening (replication)\n", sfd);
+            else
+                fprintf(stderr, "<%d new client connection (replication)\n", sfd);
+#endif /* USE_REPLICATION */
         else
             fprintf(stderr, "<%d new client connection\n", sfd);
     }
@@ -446,6 +479,12 @@ static void conn_close(conn *c) {
     stats.curr_conns--;
     STATS_UNLOCK();
 
+#ifdef USE_REPLICATION
+    if((settings.rep_mode == REP_BACKUP) && (c == rep_conn)){
+        fprintf(stderr,"replication: close\n");
+        replication_master_init();
+    }
+#endif /* USE_REPLICATION */
     return;
 }
 
@@ -738,6 +777,10 @@ int do_store_item(item *it, int comm) {
         else
             do_item_link(it);
 
+#ifdef USE_REPLICATION
+        replication_call_set(ITEM_key(it), it->nkey);
+#endif /* USE_REPLICATION */
+
         stored = 1;
     }
 
@@ -888,6 +931,12 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         pos += sprintf(pos, "STAT bytes_written %llu\r\n", stats.bytes_written);
         pos += sprintf(pos, "STAT limit_maxbytes %llu\r\n", (uint64_t) settings.maxbytes);
         pos += sprintf(pos, "STAT threads %u\r\n", settings.num_threads);
+#ifdef USE_REPLICATION
+        if(settings.rep_mode == REP_MASTER)
+            pos += sprintf(pos, "STAT replication MASTER\r\n");
+        if(settings.rep_mode == REP_BACKUP)
+            pos += sprintf(pos, "STAT replication BACKUP\r\n");
+#endif /* USE_REPLICATION */
         pos += sprintf(pos, "END");
         STATS_UNLOCK();
         out_string(c, temp);
@@ -1309,10 +1358,16 @@ char *do_add_delta(item *it, int incr, unsigned int delta, char *buf) {
         memcpy(ITEM_data(new_it), buf, res);
         memcpy(ITEM_data(new_it) + res, "\r\n", 3);
         do_item_replace(it, new_it);
+#ifdef USE_REPLICATION
+        replication_call_set(ITEM_key(it), it->nkey);
+#endif /* USE_REPLICATION */
         do_item_remove(new_it);       /* release our reference */
     } else { /* replace in-place */
         memcpy(ITEM_data(it), buf, res);
         memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
+#ifdef USE_REPLICATION
+        replication_call_set(ITEM_key(it), it->nkey);
+#endif /* USE_REPLICATION */
     }
 
     return buf;
@@ -1365,9 +1420,15 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         if (exptime == 0) {
             item_unlink(it);
             item_remove(it);      /* release our reference */
+#ifdef USE_REPLICATION
+            replication_call_del(key, nkey);
+#endif /* USE_REPLICATION */
             out_string(c, "DELETED");
         } else {
             /* our reference will be transfered to the delete queue */
+#ifdef USE_REPLICATION
+            replication_call_defer_del(key, nkey, realtime(exptime) + stats.started);
+#endif /* USE_REPLICATION */
             out_string(c, defer_delete(it, exptime));
         }
     } else {
@@ -1537,6 +1598,9 @@ static void process_command(conn *c, char *command) {
         set_current_time();
 
         if(ntokens == 2) {
+#ifdef USE_REPLICATION
+            replication_call_flush_all();
+#endif
             settings.oldest_live = current_time - 1;
             item_flush_expired();
             out_string(c, "OK");
@@ -1549,6 +1613,9 @@ static void process_command(conn *c, char *command) {
             return;
         }
 
+#ifdef USE_REPLICATION
+        replication_call_defer_flush_all(realtime(exptime) + stats.started);
+#endif
         settings.oldest_live = realtime(exptime) - 1;
         item_flush_expired();
         out_string(c, "OK");
@@ -1846,6 +1913,12 @@ static void drive_machine(conn *c) {
 
     assert(c != NULL);
 
+#ifdef USE_REPLICATION
+    if(rep_exit && (c->state != conn_pipe_recv) && (c->state != conn_rep_recv)){
+        return;
+    }
+#endif /* USE_REPLICATION */
+
     while (!stop) {
 
         switch(c->state) {
@@ -1873,7 +1946,7 @@ static void drive_machine(conn *c) {
                 break;
             }
             dispatch_conn_new(sfd, conn_read, EV_READ | EV_PERSIST,
-                                     DATA_BUFFER_SIZE, false);
+                              DATA_BUFFER_SIZE, false);
             break;
 
         case conn_read:
@@ -2045,6 +2118,64 @@ static void drive_machine(conn *c) {
                 conn_close(c);
             stop = true;
             break;
+
+#ifdef USE_REPLICATION
+        case conn_pipe_recv:
+            if(replication_pop()){
+                replication_close();
+            }else{
+                replication_send(rep_conn);
+            }
+            stop = true;
+            break;
+
+        case conn_rep_recv:
+            replication_recv(c);
+            stop = true;
+            break;
+
+        case conn_repconnect:
+            if(settings.rep_mode == REP_MASTER){
+                if (settings.verbose > 0)
+                    fprintf(stderr,"replication: accept\n");
+                addrlen = sizeof(addr);
+                res = accept(c->sfd, &addr, &addrlen);
+                if(res == -1){
+                    if(errno == EAGAIN || errno == EWOULDBLOCK) {
+                    } else if (errno == EMFILE) {
+                        fprintf(stderr, "replication: Too many opened connections\n");
+                    } else {
+                        fprintf(stderr, "replication: accept error\n");
+                    }
+                }else{
+                    if(rep_conn){
+                        close(res);
+                        fprintf(stderr,"replication: already connected\n");
+                    }else{
+                        replication_marugoto(1);
+                        rep_conn = dispatch_conn_new(res, conn_rep_recv, EV_READ | EV_PERSIST, DATA_BUFFER_SIZE, false);
+                        rep_conn->item   = NULL;
+                        rep_conn->rbytes = 0;
+                        rep_conn->rcurr  = rep_conn->rbuf;
+                        replication_connect();
+                    }
+                }
+                stop = true;
+            }
+            if(settings.rep_mode == REP_BACKUP){
+                rep_conn = c;
+                conn_set_state(c, conn_read);
+                if (settings.verbose > 0)
+                    fprintf(stderr,"replication: connect\n");
+                if(update_event(c, EV_READ | EV_PERSIST)){
+                    stop = true;
+                }else{
+                    fprintf(stderr, "replication: Couldn't update event\n");
+                    conn_set_state(c, conn_closing);
+                }
+            }
+            break;
+#endif /* USE_REPLICATION */
         }
     }
 
@@ -2343,6 +2474,10 @@ static void usage(void) {
            "-P <file>     save PID in <file>, only used with -d option\n"
            "-f <factor>   chunk size growth factor, default 1.25\n"
            "-n <bytes>    minimum space allocated for key+value+flags, default 48\n");
+#ifdef USE_REPLICATION
+    printf("-x <ip_addr>  hostname or IP address of the master replication server \n");
+    printf("-X <num>      TCP port number of the master (default: 11212)\n");
+#endif
 #ifdef USE_THREADS
     printf("-t <num>      number of threads to use, default 4\n");
 #endif
@@ -2449,8 +2584,23 @@ static void remove_pidfile(const char *pid_file) {
 
 
 static void sig_handler(const int sig) {
+#ifdef USE_REPLICATION
+    switch(sig){
+    case SIGTERM:
+    case SIGINT:
+        if(rep_send && rep_conn){
+            if(replication_exit()){
+                exit(EXIT_FAILURE);
+            }
+        }else{
+            exit(EXIT_SUCCESS);
+        }
+        break;
+    }
+#else
     printf("SIGINT handled.\n");
     exit(EXIT_SUCCESS);
+#endif /* USE_REPLICATION */
 }
 
 int main (int argc, char **argv) {
@@ -2464,9 +2614,16 @@ int main (int argc, char **argv) {
     struct passwd *pw;
     struct sigaction sa;
     struct rlimit rlim;
+#ifdef USE_REPLICATION
+    struct addrinfo  master_hint;
+    struct addrinfo *master_addr;
+#endif /* USE_REPLICATION */
 
     /* handle SIGINT */
-    signal(SIGINT, sig_handler);
+    signal(SIGINT,  sig_handler);
+#ifdef USE_REPLICATION
+    signal(SIGTERM, sig_handler);
+#endif /* USE_REPLICATION */
 
     /* init settings */
     settings_init();
@@ -2475,7 +2632,11 @@ int main (int argc, char **argv) {
     setbuf(stderr, NULL);
 
     /* process arguments */
+#ifdef USE_REPLICATION
+    while ((c = getopt(argc, argv, "bp:s:U:m:Mc:khirvdl:u:P:f:s:n:t:D:X:x:")) != -1) {
+#else
     while ((c = getopt(argc, argv, "bp:s:U:m:Mc:khirvdl:u:P:f:s:n:t:D:")) != -1) {
+#endif /* USE_REPLICATION */
         switch (c) {
         case 'U':
             settings.udpport = atoi(optarg);
@@ -2559,6 +2720,28 @@ int main (int argc, char **argv) {
             settings.prefix_delimiter = optarg[0];
             settings.detail_enabled = 1;
             break;
+#ifdef USE_REPLICATION
+        case 'x':
+            if (inet_pton(AF_INET, optarg, &addr) <= 0) {
+                memset(&master_hint, 0, sizeof(master_hint));
+                master_hint.ai_flags    = 0;
+                master_hint.ai_socktype = 0;
+                master_hint.ai_protocol = 0;
+                if(!getaddrinfo(optarg, NULL, &master_hint, &master_addr)){
+                    settings.rep_addr = ((struct sockaddr_in *)(master_addr->ai_addr)) -> sin_addr;
+                    freeaddrinfo(master_addr);
+                }else{
+                    fprintf(stderr, "Illegal address: %s\n", optarg);
+                    return 1;
+                }
+            } else {
+                settings.rep_addr = addr;
+            }
+            break;
+        case 'X':
+            settings.rep_port = atoi(optarg);
+            break;
+#endif /* USE_REPLICATION */
         default:
             fprintf(stderr, "Illegal argument \"%c\"\n", c);
             return 1;
@@ -2718,6 +2901,13 @@ int main (int argc, char **argv) {
         fprintf(stderr, "failed to create listening connection");
         exit(EXIT_FAILURE);
     }
+
+#ifdef USE_REPLICATION
+    if(replication_init() == -1){
+        exit(EXIT_FAILURE);
+    }
+#endif /* USE_REPLICATION */
+
     /* save the PID in if we're a daemon */
     if (daemonize)
         save_pid(getpid(), pid_file);
@@ -2745,3 +2935,402 @@ int main (int argc, char **argv) {
         remove_pidfile(pid_file);
     return 0;
 }
+
+#ifdef USE_REPLICATION
+static int replication_master_init()
+{
+    int s = server_socket(settings.rep_port, 0);
+
+    rep_recv = NULL;
+    rep_send = NULL;
+    rep_conn = NULL;
+    settings.rep_mode = REP_MASTER;
+
+    if (s == -1) {
+        fprintf(stderr, "replication: failed to initialize replication master socket");
+    }else{
+        if(!conn_new(s, conn_repconnect, EV_READ | EV_PERSIST, 1, false, main_base)){
+            fprintf(stderr, "replication: failed to create replication master conn");
+        }else{
+            if (settings.verbose > 0)
+                fprintf(stderr, "replication: master start\n");
+         }
+    }
+    return(s);
+}
+
+static int replication_backup_init()
+{
+    struct sockaddr_in master;
+    int s = new_socket(0);
+
+    rep_recv  = NULL;
+    rep_send  = NULL;
+    rep_conn  = NULL;
+    settings.rep_mode = REP_BACKUP;
+
+    if(s == -1) {
+        fprintf(stderr, "replication: failed to replication backup socket\n");
+    }else{
+        /* connect */
+        memset((char *)&master, 0, sizeof(master));
+        master.sin_family = AF_INET;
+        master.sin_addr   = settings.rep_addr;
+        master.sin_port   = htons(settings.rep_port);
+        if(connect(s,(struct sockaddr *)&master, sizeof(master)) == 0){
+            fprintf(stdout,"replication: connection succeed?!\n");
+            close(s);
+            s = -1;
+        }else{
+            if(errno == EINPROGRESS){
+                if (settings.verbose > 0)
+                    fprintf(stdout,"replication: backup start (master=%s:%d)\n", inet_ntoa(settings.rep_addr), settings.rep_port);
+                if(!conn_new(s, conn_repconnect, EV_WRITE | EV_PERSIST, DATA_BUFFER_SIZE, false, main_base)){
+                    fprintf(stderr, "replication: failed to create backup conn");
+                    close(s);
+                    s = -1;
+                }
+            }else{
+                fprintf(stdout,"replication: can't connect %s:%d\n", inet_ntoa(master.sin_addr), ntohs(master.sin_port));
+                close(s);
+                s = -1;
+            }
+        }
+    }
+    return(s);
+}
+
+static int replication_init()
+{
+    if(settings.rep_addr.s_addr == htonl(INADDR_ANY)){
+        return(replication_master_init());
+    }else{
+        return(replication_backup_init());
+    }
+}
+
+static int replication_connect()
+{
+    int f;
+    int p[2];
+
+    if(pipe(p) == -1){
+        return(-1);
+    }else{
+        if((f = fcntl(p[0], F_GETFL, 0)) < 0 || fcntl(p[0], F_SETFL, f | O_NONBLOCK) < 0) {
+            fprintf(stderr, "replication: can't setting O_NONBLOCK pipe[0]\n");
+            return(-1);
+        }
+        if((f = fcntl(p[1], F_GETFL, 0)) < 0 || fcntl(p[1], F_SETFL, f | O_NONBLOCK) < 0) {
+            fprintf(stderr, "replication: can't setting O_NONBLOCK pipe[0]\n");
+            return(-1);
+        }
+        rep_recv = conn_new(p[0], conn_pipe_recv, EV_READ | EV_PERSIST, DATA_BUFFER_SIZE, false, main_base);
+        rep_send = conn_new(p[1], conn_pipe_send, EV_READ | EV_PERSIST, DATA_BUFFER_SIZE, false, main_base);
+        event_del(&rep_send->event);
+        replication_marugoto(0);
+    }
+    return(0);
+}
+
+static int replication_close()
+{
+    int     c;
+    int     r;
+    Q_ITEM *q;
+
+    fprintf(stderr,"replication: close\n");
+    if(rep_recv){
+        rep_recv->rbytes = sizeof(q);
+        rep_recv->rcurr  = rep_recv->rbuf;
+        c = 0;
+        do{
+            r = read(rep_recv->sfd, rep_recv->rcurr, rep_recv->rbytes);
+            if(r == -1){
+                break;
+            }
+            rep_recv->rbytes -= r;
+            rep_recv->rcurr  += r;
+            if(!rep_recv->rbytes){
+                memcpy(&q, rep_recv->rbuf, sizeof(q));
+                rep_recv->rbytes = sizeof(q);
+                rep_recv->rcurr  = rep_recv->rbuf;
+                qi_free(q);
+                c++;
+            }
+        }while(r);
+        conn_close(rep_recv);
+        rep_recv = NULL;
+        if (settings.verbose > 1) {
+            fprintf(stderr, "replication: qitem free %d items\n", qi_free_list());
+            fprintf(stderr, "replication: close recv %d items\n", c);
+        }
+    }
+    if(rep_send){
+        conn_close(rep_send);
+        rep_send = NULL;
+        if (settings.verbose > 1)
+            fprintf(stderr,"replication: close send\n");
+    }
+    if(rep_conn){
+        conn_close(rep_conn);
+        rep_conn = NULL;
+        if (settings.verbose > 1)
+            fprintf(stderr,"replication: close conn\n");
+    }
+    return(0);
+}
+
+static int replication_marugoto(int f)
+{
+    static int   keycount = 0;
+    static char *keylist  = NULL;
+    static char *keyptr   = NULL;
+
+    if(f){
+        if(keylist){
+            free(keylist);
+            keylist  = NULL;
+            keyptr   = NULL;
+            keycount = 0;
+        }
+        keylist = assoc_key_snap(&keycount);
+        if(keyptr = keylist){
+            if (settings.verbose > 0)
+                fprintf(stderr,"replication: marugoto start %d\n", keycount);
+        }
+    }else{
+        if(keyptr){
+            if(*keyptr){
+                replication_call_set(keyptr, strlen(keyptr));
+                keyptr += strlen(keyptr) + 1;
+                keycount--;
+            }else{
+                free(keylist);
+                keylist  = NULL;
+                keyptr   = NULL;
+                keycount = 0;
+                if (settings.verbose > 0)
+                    fprintf(stderr,"replication: marugoto owari\n");
+            }
+        }
+    }
+    return(0);
+}
+
+static int replication_recv(conn *c)
+{
+    int i;
+    int l;
+    int r;
+    char *e;
+    char s[64];
+
+    if(c->rsize - c->rbytes == 0){
+        fprintf(stderr, "replication: recv overfllow\n");
+        replication_close();
+        return(-1);
+    }else{
+        r = read(c->sfd, c->rcurr, c->rsize - c->rbytes);
+        if(r == -1){
+            if(errno == EAGAIN || errno == EINTR){
+                fprintf(stderr,"replication: recv AEGAIN or EINTR\n");
+            }else{
+                fprintf(stderr,"replication: recv error\n");
+                replication_close();
+                return(-1);
+            }
+        }else{
+            if(r == 0){
+                replication_close();
+                return(-1);
+            }else{
+                c->rbytes += r;
+                c->rcurr  += r;
+                while(e = memchr(c->rbuf,'\n',c->rbytes)){
+                    e++;
+                    l = (e - c->rbuf);
+                    if(l >= sizeof(s)){
+                        fprintf(stderr, "replication: result string too long\n");
+                        replication_close();
+                        return(-1);
+                    }else{
+                        memcpy(s, c->rbuf, l);
+                        s[l] = 0;
+                        for(i=0;rep_rs[i];i++){
+                            if(!strcmp(rep_rs[i], s)){
+                                break;
+                            }
+                        }
+                        if(!rep_rs[i]){
+                            fprintf(stderr, "replication: result error -> %s", s);
+                            replication_close();
+                            return(-1);
+                        }
+                    }
+                    c->rcurr  -= l;
+                    c->rbytes -= l;
+                    if(c->rbytes){
+                        memmove(c->rbuf, e, c->rbytes);
+                    }else{
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return(0);
+}
+
+static int replication_send(conn *c)
+{
+    int l;
+    int w;
+
+    while(c->wbytes){
+        l = rep_send->wcurr - rep_send->wbuf;
+        w = write(c->sfd, c->wcurr, c->wbytes);
+        if(w == -1){
+            if(errno == EAGAIN || errno == EINTR){
+                fprintf(stderr,"replication: send AEGAIN or EINTR\n");
+                if(l){
+                    rep_send->wbytes -= l;
+                    memmove(rep_send->wbuf, rep_send->wcurr, rep_send->wbytes);
+                    rep_send->wcurr = rep_send->wbuf;
+                }
+                break;
+            }else{
+                fprintf(stderr,"replication: send error\n");
+                replication_close();
+                break;
+            }
+        }else{
+            c->wbytes -= w;
+            c->wcurr  += w;
+        }
+    }
+    return(c->wbytes);
+}
+
+
+static int replication_pop()
+{
+    int      r;
+    int      c;
+    Q_ITEM **q;
+
+    r = read(rep_recv->sfd, rep_recv->rbuf, rep_recv->rsize);
+    if(r == -1){
+        if(errno == EAGAIN || errno == EINTR){
+        }else{
+            fprintf(stderr,"replication: pop error %d\n", errno);
+            return(-1);
+        }
+    }else{
+        c = r / sizeof(Q_ITEM *);
+        q = (Q_ITEM **)(rep_recv->rbuf);
+        while(c--){
+            if(q[c]){
+                if(replication_cmd(rep_conn, q[c])){
+                    replication_item(q[c]); /* error retry */
+                }else{
+                    qi_free(q[c]);
+                }
+            }else{
+                if(!rep_exit){
+                    fprintf(stderr,"replication: cleanup start\n");
+                    rep_exit = 1;
+                }
+            }
+        }
+    }
+    if(rep_exit){
+        if(rep_conn->wbytes){
+            /* retry */
+            if(replication_exit()){
+                replication_close();
+                fprintf(stderr,"replication: cleanup error\n");
+                exit(EXIT_FAILURE);
+            }
+        }else{
+            /* finish */
+            replication_close();
+            fprintf(stderr,"replication: cleanup complate\n");
+            exit(EXIT_SUCCESS);
+        }
+    }
+    replication_marugoto(0);
+    return(0);
+}
+
+static int replication_push()
+{
+    int w;
+    int l;
+
+    while(rep_send->wbytes){
+        l = rep_send->wcurr - rep_send->wbuf;
+        w = write(rep_send->sfd, rep_send->wcurr, rep_send->wbytes);
+        if(w == -1){
+            if(errno == EAGAIN || errno == EINTR){
+                if(l){
+                    rep_send->wbytes -= l;
+                    memmove(rep_send->wbuf, rep_send->wcurr, rep_send->wbytes);
+                }
+                break;
+            }else{
+                return(-1);
+            }
+        }else{
+            rep_send->wbytes -= w;
+            rep_send->wcurr  += w;
+        }
+    }
+    rep_send->wcurr = rep_send->wbuf;
+    return(0);
+}
+
+static int replication_exit()
+{
+    return(replication_item(NULL));
+}
+
+static int replication_item(Q_ITEM *q)
+{
+    if(rep_send->wcurr + rep_send->wbytes + sizeof(q) > rep_send->wbuf + rep_send->wsize){
+        fprintf(stderr,"replication: buffer over fllow\n");
+        if(q){
+            qi_free(q);
+        }
+        replication_close();
+        return(-1);
+    }
+    memcpy(rep_send->wcurr + rep_send->wbytes, &q, sizeof(q));
+    rep_send->wbytes += sizeof(q);
+    if(replication_push()){
+        fprintf(stderr, "replication: push error\n");
+        if(q){
+            qi_free(q);
+        }
+        replication_close();
+        return(-1);
+    }
+    return(0);
+}
+
+int replication(enum CMD_TYPE type, R_CMD *cmd)
+{
+    Q_ITEM *q;
+
+    if(rep_send && rep_conn){
+        if(q = qi_new(type, cmd)) {
+            replication_item(q);
+        }else{
+            fprintf(stderr,"replication: can't create Q_ITEM\n");
+            replication_close();
+            return(-1);
+        }
+    }
+    return(0);
+}
+#endif /* USE_REPLICATION */
