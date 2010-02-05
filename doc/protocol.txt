@@ -53,12 +53,13 @@ Commands
 
 There are three types of commands. 
 
-Storage commands (there are three: "set", "add" and "replace") ask the
-server to store some data identified by a key. The client sends a
-command line, and then a data block; after that the client expects one
-line of response, which will indicate success or faulure.
+Storage commands (there are six: "set", "add", "replace", "append"
+"prepend" and "cas") ask the server to store some data identified by a key. The
+client sends a command line, and then a data block; after that the
+client expects one line of response, which will indicate success or
+faulure.
 
-Retrieval commands (there is only one: "get") ask the server to
+Retrieval commands (there are two: "get" and "gets") ask the server to
 retrieve data corresponding to a set of keys (one or more keys in one
 request). The client sends a command line, which includes all the
 requested keys; after that for each item the server finds it sends to
@@ -125,9 +126,9 @@ Storage commands
 
 First, the client sends a command line which looks like this:
 
-<command name> <key> <flags> <exptime> <bytes>\r\n
+<command name> <key> <flags> <exptime> <bytes> [<cas unqiue>]\r\n
 
-- <command name> is "set", "add" or "replace"
+- <command name> is "set", "add", "replace", "append", "prepend", or "cas"
 
   "set" means "store this data".  
 
@@ -137,12 +138,26 @@ First, the client sends a command line which looks like this:
   "replace" means "store this data, but only if the server *does*
   already hold data for this key".
 
+  "append" means "add this data to an existing key after existing data".
+
+  "prepend" means "add this data to an existing key before existing data".
+
+  The append and prepend commands do not accept flags or exptime.
+  They update existing data portions, and ignore new flag and exptime
+  settings.
+
+  "cas" is a check and set operation which means "store this data but
+  only if no one else has updated since I last fetched it."
+
 - <key> is the key under which the client asks to store the data
 
 - <flags> is an arbitrary 16-bit unsigned integer (written out in
   decimal) that the server stores along with the data and sends back
   when the item is retrieved. Clients may use this as a bit field to
   store data-specific information; this field is opaque to the server.
+  Note that in memcached 1.2.1 and higher, flags may be 32-bits, instead
+  of 16, but you might want to restrict yourself to 16 bits for
+  compatibility with older versions.
 
 - <exptime> is expiration time. If it's 0, the item never expires
   (although it may be deleted from the cache to make place for other
@@ -154,6 +169,10 @@ First, the client sends a command line which looks like this:
 - <bytes> is the number of bytes in the data block to follow, *not*
   including the delimiting \r\n. <bytes> may be zero (in which case
   it's followed by an empty data block).
+
+- <cas unique> is a unique 64-bit value of an existing entry.
+  Clients should use the value returned from the "gets" command
+  when issuing "cas" updates.
 
 After this line, the client sends the data block:
 
@@ -172,13 +191,17 @@ because of an error. This normally means that either that the
 condition for an "add" or a "replace" command wasn't met, or that the
 item is in a delete queue (see the "delete" command below).
 
+- "EXISTS\r\n" to indicate that the item you are trying to store with
+a "cas" command has been modified since you last fetched it.
+
 
 Retrieval command:
 ------------------
 
-The retrieval command looks like this:
+The retrieval commands "get" and "gets" operates like this:
 
 get <key>*\r\n
+gets <key>*\r\n
 
 - <key>* means one or more key strings separated by whitespace.
 
@@ -192,7 +215,7 @@ to indicate the end of response.
 
 Each item sent by the server looks like this:
 
-VALUE <key> <flags> <bytes>\r\n
+VALUE <key> <flags> <bytes> [<cas unique>]\r\n
 <data block>\r\n
 
 - <key> is the key for the item being sent
@@ -202,6 +225,9 @@ VALUE <key> <flags> <bytes>\r\n
 - <bytes> is the length of the data block to follow, *not* including
   its delimiting \r\n
 
+- <cas unique> is a unique 64-bit integer that uniquely identifies
+  this specific item.
+
 - <data block> is the data for this item.
 
 If some of the keys appearing in a retrieval request are not sent back
@@ -209,7 +235,6 @@ by the server in the item list this means that the server does not
 hold items with such keys (because they were never stored, or stored
 but deleted to make space for more items, or expired, or explicitly
 deleted by a client).
-
 
 
 Deletion
@@ -249,7 +274,7 @@ Increment/Decrement
 
 Commands "incr" and "decr" are used to change data for some item
 in-place, incrementing or decrementing it. The data for the item is
-treated as decimal representation of a 32-bit unsigned integer. If the
+treated as decimal representation of a 64-bit unsigned integer. If the
 current data value does not conform to such a representation, the
 commands behave as if the value were 0. Also, the item must already
 exist for incr/decr to work; these commands won't pretend that a
@@ -266,7 +291,7 @@ decr <key> <value>\r\n
 - <key> is the key of the item the client wishes to change
 
 - <value> is the amount by which the client wants to increase/decrease
-the item. It is a decimal representation of a 32-bit unsigned integer.
+the item. It is a decimal representation of a 64-bit unsigned integer.
 
 The response will be one of:
 
@@ -276,8 +301,8 @@ The response will be one of:
   after the increment/decrement operation was carried out.
 
 Note that underflow in the "decr" command is caught: if a client tries
-to decrease the value below 0, the new value will be 0. Overflow in
-the "incr" command is not checked.
+to decrease the value below 0, the new value will be 0.  Overflow in
+the "incr" command will wrap around the 64 bit mark.
 
 Note also that decrementing a number such that it loses length isn't
 guaranteed to decrement its returned length.  The number MAY be
@@ -332,6 +357,8 @@ pid               32u      Process id of this server process
 uptime            32u      Number of seconds this server has been running
 time              32u      current UNIX time according to the server
 version           string   Version string of this server
+pointer_size      32       Default size of pointers on the host OS
+                           (generally 32 or 64)
 rusage_user       32u:32u  Accumulated user time for this process 
                            (seconds:microseconds)
 rusage_system     32u:32u  Accumulated system time for this process 
@@ -352,14 +379,16 @@ get_hits          64u      Number of keys that have been requested and
                            found present
 get_misses        64u      Number of items that have been requested 
                            and not found
-evictions         64u      Number of items removed from cache because
-                           they passed their expiration time
+evictions         64u      Number of valid items removed from cache                                                                           
+                           to free memory for new items                                                                                       
 bytes_read        64u      Total number of bytes read by this server 
                            from network
 bytes_written     64u      Total number of bytes sent by this server to 
                            network
 limit_maxbytes    32u      Number of bytes this server is allowed to
                            use for storage. 
+threads           32u      Number of worker threads requested.
+                           (see doc/threads.txt)
 
 
 

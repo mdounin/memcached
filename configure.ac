@@ -1,11 +1,12 @@
 AC_PREREQ(2.52)
-AC_INIT(memcached, 1.2.2, brad@danga.com)
+AC_INIT(memcached, 1.2.4, brad@danga.com)
 AC_CANONICAL_SYSTEM
 AC_CONFIG_SRCDIR(memcached.c)
 AM_INIT_AUTOMAKE(AC_PACKAGE_NAME, AC_PACKAGE_VERSION)
 AM_CONFIG_HEADER(config.h)
 
 AC_PROG_CC
+AM_PROG_CC_C_O
 AC_PROG_INSTALL
 
 trylibeventdir=""
@@ -110,7 +111,7 @@ AC_CHECK_MEMBER([struct mallinfo.arena], [
 
 dnl From licq: Copyright (c) 2000 Dirk Mueller
 dnl Check if the type socklen_t is defined anywhere
-AC_DEFUN(AC_C_SOCKLEN_T,
+AC_DEFUN([AC_C_SOCKLEN_T],
 [AC_CACHE_CHECK(for socklen_t, ac_cv_c_socklen_t,
 [
   AC_TRY_COMPILE([
@@ -132,7 +133,7 @@ fi
 AC_C_SOCKLEN_T
 
 dnl Check if we're a little-endian or a big-endian system, needed by hash code
-AC_DEFUN(AC_C_ENDIAN,
+AC_DEFUN([AC_C_ENDIAN],
 [AC_CACHE_CHECK(for endianness, ac_cv_c_endian,
 [
   AC_RUN_IFELSE(
@@ -175,6 +176,7 @@ AC_ARG_ENABLE(replication,
      AC_DEFINE([USE_REPLICATION],,[Define this if you want to use replication])
    fi
   ])
+
 AM_CONDITIONAL(ENABLE_REPLICATION, test "x$enable_replication" = "xyes")
 
 AC_CHECK_FUNCS(mlockall)

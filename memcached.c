@@ -35,7 +35,6 @@ std *
 #include <pwd.h>
 #include <sys/mman.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -55,7 +54,7 @@ std *
 
 /* FreeBSD 4.x doesn't have IOV_MAX exposed. */
 #ifndef IOV_MAX
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(__APPLE__)
 # define IOV_MAX 1024
 #endif
 #endif
@@ -89,7 +88,6 @@ static int transmit(conn *c);
 static int ensure_iov_space(conn *c);
 static int add_iov(conn *c, const void *buf, int len);
 static int add_msghdr(conn *c);
-
 
 /* time handling */
 static void set_current_time(void);  /* update the global variable holding
@@ -125,7 +123,7 @@ struct stats stats;
 struct settings settings;
 
 /** file scope variables **/
-static item **todelete = 0;
+static item **todelete = NULL;
 static int delcurr;
 static int deltotal;
 static conn *listen_conn;
@@ -187,10 +185,11 @@ static void stats_reset(void) {
 }
 
 static void settings_init(void) {
+    settings.access=0700;
     settings.port = 11211;
     settings.udpport = 0;
     settings.interf.s_addr = htonl(INADDR_ANY);
-    settings.maxbytes = 67108864; /* default is 64MB: (64 * 1024 * 1024) */
+    settings.maxbytes = 64 * 1024 * 1024; /* default is 64MB */
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
     settings.oldest_live = 0;
@@ -246,8 +245,11 @@ static int add_msghdr(conn *c)
     memset(msg, 0, sizeof(struct msghdr));
 
     msg->msg_iov = &c->iov[c->iovused];
-    msg->msg_name = &c->request_addr;
-    msg->msg_namelen = c->request_addr_size;
+
+    if (c->request_addr_size > 0) {
+        msg->msg_name = &c->request_addr;
+        msg->msg_namelen = c->request_addr_size;
+    }
 
     c->msgbytes = 0;
     c->msgused++;
@@ -273,7 +275,7 @@ static int freecurr;
 static void conn_init(void) {
     freetotal = 200;
     freecurr = 0;
-    if (!(freeconns = (conn **)malloc(sizeof(conn *) * freetotal))) {
+    if ((freeconns = (conn **)malloc(sizeof(conn *) * freetotal)) == NULL) {
         perror("malloc()");
     }
     return;
@@ -299,10 +301,10 @@ conn *do_conn_from_freelist() {
  * Adds a connection to the freelist. 0 = success. Should call this using
  * conn_add_to_freelist() for thread safety.
  */
-int do_conn_add_to_freelist(conn *c) {
+bool do_conn_add_to_freelist(conn *c) {
     if (freecurr < freetotal) {
         freeconns[freecurr++] = c;
-        return 0;
+        return false;
     } else {
         /* try to enlarge free connections array */
         conn **new_freeconns = realloc(freeconns, sizeof(conn *) * freetotal * 2);
@@ -310,10 +312,10 @@ int do_conn_add_to_freelist(conn *c) {
             freetotal *= 2;
             freeconns = new_freeconns;
             freeconns[freecurr++] = c;
-            return 0;
+            return false;
         }
     }
-    return 1;
+    return true;
 }
 
 conn *conn_new(const int sfd, const int init_state, const int event_flags,
@@ -327,6 +329,7 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
         }
         c->rbuf = c->wbuf = 0;
         c->ilist = 0;
+        c->suffixlist = 0;
         c->iov = 0;
         c->msglist = 0;
         c->hdrbuf = 0;
@@ -334,6 +337,7 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
         c->rsize = read_buffer_size;
         c->wsize = DATA_BUFFER_SIZE;
         c->isize = ITEM_LIST_INITIAL;
+        c->suffixsize = SUFFIX_LIST_INITIAL;
         c->iovsize = IOV_LIST_INITIAL;
         c->msgsize = MSG_LIST_INITIAL;
         c->hdrsize = 0;
@@ -341,14 +345,16 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
         c->rbuf = (char *)malloc((size_t)c->rsize);
         c->wbuf = (char *)malloc((size_t)c->wsize);
         c->ilist = (item **)malloc(sizeof(item *) * c->isize);
+        c->suffixlist = (char **)malloc(sizeof(char *) * c->suffixsize);
         c->iov = (struct iovec *)malloc(sizeof(struct iovec) * c->iovsize);
         c->msglist = (struct msghdr *)malloc(sizeof(struct msghdr) * c->msgsize);
 
         if (c->rbuf == 0 || c->wbuf == 0 || c->ilist == 0 || c->iov == 0 ||
-                c->msglist == 0) {
+                c->msglist == 0 || c->suffixlist == 0) {
             if (c->rbuf != 0) free(c->rbuf);
             if (c->wbuf != 0) free(c->wbuf);
             if (c->ilist !=0) free(c->ilist);
+            if (c->suffixlist != 0) free(c->suffixlist);
             if (c->iov != 0) free(c->iov);
             if (c->msglist != 0) free(c->msglist);
             free(c);
@@ -386,7 +392,9 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
     c->rcurr = c->rbuf;
     c->ritem = 0;
     c->icurr = c->ilist;
+    c->suffixcurr = c->suffixlist;
     c->ileft = 0;
+    c->suffixleft = 0;
     c->iovused = 0;
     c->msgcurr = 0;
     c->msgused = 0;
@@ -430,6 +438,14 @@ static void conn_cleanup(conn *c) {
         }
     }
 
+    if (c->suffixleft != 0) {
+        for (; c->suffixleft > 0; c->suffixleft--, c->suffixcurr++) {
+            if(suffix_add_to_freelist(*(c->suffixcurr))) {
+                free(*(c->suffixcurr));
+            }
+        }
+    }
+
     if (c->write_and_free) {
         free(c->write_and_free);
         c->write_and_free = 0;
@@ -451,6 +467,8 @@ void conn_free(conn *c) {
             free(c->wbuf);
         if (c->ilist)
             free(c->ilist);
+        if (c->suffixlist)
+            free(c->suffixlist);
         if (c->iov)
             free(c->iov);
         free(c);
@@ -564,6 +582,63 @@ static void conn_set_state(conn *c, int state) {
     }
 }
 
+/*
+ * Free list management for suffix buffers.
+ */
+
+static char **freesuffix;
+static int freesuffixtotal;
+static int freesuffixcurr;
+
+static void suffix_init(void) {
+    freesuffixtotal = 500;
+    freesuffixcurr  = 0;
+
+    freesuffix = (char **)malloc( sizeof(char *) * freesuffixtotal );
+    if (freesuffix == NULL) {
+        perror("malloc()");
+    }
+    return;
+}
+
+/*
+ * Returns a suffix buffer from the freelist, if any. Should call this using
+ * suffix_from_freelist() for thread safety.
+ */
+char *do_suffix_from_freelist() {
+    char *s;
+
+    if (freesuffixcurr > 0) {
+        s = freesuffix[--freesuffixcurr];
+    } else {
+        /* If malloc fails, let the logic fall through without spamming
+         * STDERR on the server. */
+        s = malloc( SUFFIX_SIZE );
+    }
+
+    return s;
+}
+
+/*
+ * Adds a connection to the freelist. 0 = success. Should call this using
+ * conn_add_to_freelist() for thread safety.
+ */
+bool do_suffix_add_to_freelist(char *s) {
+    if (freesuffixcurr < freesuffixtotal) {
+        freesuffix[freesuffixcurr++] = s;
+        return false;
+    } else {
+        /* try to enlarge free connections array */
+        char **new_freesuffix = realloc(freesuffix, freesuffixtotal * 2);
+        if (new_freesuffix) {
+            freesuffixtotal *= 2;
+            freesuffix = new_freesuffix;
+            freesuffix[freesuffixcurr++] = s;
+            return false;
+        }
+    }
+    return true;
+}
 
 /*
  * Ensures that there is room for another struct iovec in a connection's
@@ -726,6 +801,7 @@ static void complete_nread(conn *c) {
 
     item *it = c->item;
     int comm = c->item_comm;
+    int ret;
 
     STATS_LOCK();
     stats.set_cmds++;
@@ -734,11 +810,15 @@ static void complete_nread(conn *c) {
     if (strncmp(ITEM_data(it) + it->nbytes - 2, "\r\n", 2) != 0) {
         out_string(c, "CLIENT_ERROR bad data chunk");
     } else {
-        if (store_item(it, comm)) {
-            out_string(c, "STORED");
-        } else {
-            out_string(c, "NOT_STORED");
-        }
+      ret = store_item(it, comm);
+      if (ret == 1)
+          out_string(c, "STORED");
+      else if(ret == 2)
+          out_string(c, "EXISTS");
+      else if(ret == 3)
+          out_string(c, "NOT_FOUND");
+      else
+          out_string(c, "NOT_STORED");
     }
 
     item_remove(c->item);       /* release the c->item reference */
@@ -757,14 +837,75 @@ int do_store_item(item *it, int comm) {
     item *old_it = do_item_get_notedeleted(key, it->nkey, &delete_locked);
     int stored = 0;
 
+    item *new_it = NULL;
+    int flags;
+
     if (old_it != NULL && comm == NREAD_ADD) {
         /* add only adds a nonexistent item, but promote to head of LRU */
         do_item_update(old_it);
-    } else if (!old_it && comm == NREAD_REPLACE) {
+    } else if (!old_it && (comm == NREAD_REPLACE
+        || comm == NREAD_APPEND || comm == NREAD_PREPEND))
+    {
         /* replace only replaces an existing value; don't store */
-    } else if (delete_locked && (comm == NREAD_REPLACE || comm == NREAD_ADD)) {
+    } else if (delete_locked && (comm == NREAD_REPLACE || comm == NREAD_ADD
+        || comm == NREAD_APPEND || comm == NREAD_PREPEND))
+    {
         /* replace and add can't override delete locks; don't store */
+    } else if (comm == NREAD_CAS) {
+        /* validate cas operation */
+        if (delete_locked)
+            old_it = do_item_get_nocheck(key, it->nkey);
+
+        if(old_it == NULL) {
+          // LRU expired
+          stored = 3;
+        }
+        else if(it->cas_id == old_it->cas_id) {
+          // cas validates
+          do_item_replace(old_it, it);
+#ifdef USE_REPLICATION
+          replication_call_set(ITEM_key(it), it->nkey);
+#endif /* USE_REPLICATION */
+          stored = 1;
+        }
+        else
+        {
+          stored = 2;
+        }
     } else {
+        /*
+         * Append - combine new and old record into single one. Here it's
+         * atomic and thread-safe.
+         */
+
+        if (comm == NREAD_APPEND || comm == NREAD_PREPEND) {
+
+            /* we have it and old_it here - alloc memory to hold both */
+            /* flags was already lost - so recover them from ITEM_suffix(it) */
+
+            flags = (int) strtol(ITEM_suffix(old_it), (char **) NULL, 10);
+
+            new_it = do_item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */);
+
+            if (new_it == NULL) {
+                /* SERVER_ERROR out of memory */
+                return 0;
+            }
+
+            /* copy data from it and old_it to new_it */
+
+            if (comm == NREAD_APPEND) {
+                memcpy(ITEM_data(new_it), ITEM_data(old_it), old_it->nbytes);
+                memcpy(ITEM_data(new_it) + old_it->nbytes - 2 /* CRLF */, ITEM_data(it), it->nbytes);
+            } else {
+                /* NREAD_PREPEND */
+                memcpy(ITEM_data(new_it), ITEM_data(it), it->nbytes);
+                memcpy(ITEM_data(new_it) + it->nbytes - 2 /* CRLF */, ITEM_data(old_it), old_it->nbytes);
+            }
+
+            it = new_it;
+        }
+
         /* "set" commands can override the delete lock
            window... in which case we have to find the old hidden item
            that's in the namespace/LRU but wasn't returned by
@@ -780,12 +921,14 @@ int do_store_item(item *it, int comm) {
 #ifdef USE_REPLICATION
         replication_call_set(ITEM_key(it), it->nkey);
 #endif /* USE_REPLICATION */
-
         stored = 1;
     }
 
-    if (old_it)
+    if (old_it != NULL)
         do_item_remove(old_it);         /* release our reference */
+    if (new_it != NULL)
+        do_item_remove(new_it);
+
     return stored;
 }
 
@@ -799,7 +942,7 @@ typedef struct token_s {
 #define KEY_TOKEN 1
 #define KEY_MAX_LENGTH 250
 
-#define MAX_TOKENS 6
+#define MAX_TOKENS 7
 
 /*
  * Tokenize the command string by replacing whitespace with '\0' and update
@@ -856,7 +999,20 @@ static size_t tokenize_command(char *command, token_t *tokens, const size_t max_
     return ntokens;
 }
 
-inline void process_stats_detail(conn *c, const char *command) {
+/* set up a connection to write a buffer then free it, used for stats */
+static void write_and_free(conn *c, char *buf, int bytes) {
+    if (buf) {
+        c->write_and_free = buf;
+        c->wcurr = buf;
+        c->wbytes = bytes;
+        conn_set_state(c, conn_write);
+        c->write_and_go = conn_read;
+    } else {
+        out_string(c, "SERVER_ERROR out of memory");
+    }
+}
+
+inline static void process_stats_detail(conn *c, const char *command) {
     assert(c != NULL);
 
     if (strcmp(command, "on") == 0) {
@@ -870,16 +1026,7 @@ inline void process_stats_detail(conn *c, const char *command) {
     else if (strcmp(command, "dump") == 0) {
         int len;
         char *stats = stats_prefix_dump(&len);
-        if (NULL != stats) {
-            c->write_and_free = stats;
-            c->wcurr = stats;
-            c->wbytes = len;
-            conn_set_state(c, conn_write);
-            c->write_and_go = conn_read;
-        }
-        else {
-            out_string(c, "SERVER_ERROR");
-        }
+        write_and_free(c, stats, len);
     }
     else {
         out_string(c, "CLIENT_ERROR usage: stats detail on|off|dump");
@@ -904,9 +1051,11 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         char temp[1024];
         pid_t pid = getpid();
         char *pos = temp;
-        struct rusage usage;
 
+#ifndef WIN32
+        struct rusage usage;
         getrusage(RUSAGE_SELF, &usage);
+#endif /* !WIN32 */
 
         STATS_LOCK();
         pos += sprintf(pos, "STAT pid %u\r\n", pid);
@@ -914,8 +1063,10 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         pos += sprintf(pos, "STAT time %ld\r\n", now + stats.started);
         pos += sprintf(pos, "STAT version " VERSION "\r\n");
         pos += sprintf(pos, "STAT pointer_size %d\r\n", 8 * sizeof(void *));
+#ifndef WIN32
         pos += sprintf(pos, "STAT rusage_user %ld.%06ld\r\n", usage.ru_utime.tv_sec, usage.ru_utime.tv_usec);
         pos += sprintf(pos, "STAT rusage_system %ld.%06ld\r\n", usage.ru_stime.tv_sec, usage.ru_stime.tv_usec);
+#endif /* !WIN32 */
         pos += sprintf(pos, "STAT curr_items %u\r\n", stats.curr_items);
         pos += sprintf(pos, "STAT total_items %u\r\n", stats.total_items);
         pos += sprintf(pos, "STAT bytes %llu\r\n", stats.curr_bytes);
@@ -975,13 +1126,14 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
 #endif /* HAVE_STRUCT_MALLINFO */
 #endif /* HAVE_MALLOC_H */
 
+#if !defined(WIN32) || !defined(__APPLE__)
     if (strcmp(subcommand, "maps") == 0) {
         char *wbuf;
         int wsize = 8192; /* should be enough */
         int fd;
         int res;
 
-        if (!(wbuf = (char *)malloc(wsize))) {
+        if ((wbuf = (char *)malloc(wsize)) == NULL) {
             out_string(c, "SERVER_ERROR out of memory");
             return;
         }
@@ -1004,15 +1156,12 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
             free(wbuf); close(fd);
             return;
         }
-        memcpy(wbuf + res, "END\r\n", 6);
-        c->write_and_free = wbuf;
-        c->wcurr = wbuf;
-        c->wbytes = res + 5; // Don't write the terminal '\0'
-        conn_set_state(c, conn_write);
-        c->write_and_go = conn_read;
+        memcpy(wbuf + res, "END\r\n", 5);
+        write_and_free(c, wbuf, res + 5);
         close(fd);
         return;
     }
+#endif
 
     if (strcmp(subcommand, "cachedump") == 0) {
 
@@ -1033,38 +1182,21 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         }
 
         buf = item_cachedump(id, limit, &bytes);
-        if (buf == 0) {
-            out_string(c, "SERVER_ERROR out of memory");
-            return;
-        }
-
-        c->write_and_free = buf;
-        c->wcurr = buf;
-        c->wbytes = bytes;
-        conn_set_state(c, conn_write);
-        c->write_and_go = conn_read;
+        write_and_free(c, buf, bytes);
         return;
     }
 
     if (strcmp(subcommand, "slabs") == 0) {
         int bytes = 0;
         char *buf = slabs_stats(&bytes);
-        if (!buf) {
-            out_string(c, "SERVER_ERROR out of memory");
-            return;
-        }
-        c->write_and_free = buf;
-        c->wcurr = buf;
-        c->wbytes = bytes;
-        conn_set_state(c, conn_write);
-        c->write_and_go = conn_read;
+        write_and_free(c, buf, bytes);
         return;
     }
 
     if (strcmp(subcommand, "items") == 0) {
-        char buffer[4096];
-        item_stats(buffer, 4096);
-        out_string(c, buffer);
+        int bytes = 0;
+        char *buf = item_stats(&bytes);
+        write_and_free(c, buf, bytes);
         return;
     }
 
@@ -1079,16 +1211,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     if (strcmp(subcommand, "sizes") == 0) {
         int bytes = 0;
         char *buf = item_stats_sizes(&bytes);
-        if (! buf) {
-            out_string(c, "SERVER_ERROR out of memory");
-            return;
-        }
-
-        c->write_and_free = buf;
-        c->wcurr = buf;
-        c->wbytes = bytes;
-        conn_set_state(c, conn_write);
-        c->write_and_go = conn_read;
+        write_and_free(c, buf, bytes);
         return;
     }
 
@@ -1096,13 +1219,16 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
 }
 
 /* ntokens is overwritten here... shrug.. */
-static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens) {
+static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas) {
     char *key;
     size_t nkey;
     int i = 0;
     item *it;
     token_t *key_token = &tokens[KEY_TOKEN];
-
+    char *suffix;
+    int stats_get_cmds   = 0;
+    int stats_get_hits   = 0;
+    int stats_get_misses = 0;
     assert(c != NULL);
 
     if (settings.managed) {
@@ -1125,13 +1251,16 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens)
             nkey = key_token->length;
 
             if(nkey > KEY_MAX_LENGTH) {
+                STATS_LOCK();
+                stats.get_cmds   += stats_get_cmds;
+                stats.get_hits   += stats_get_hits;
+                stats.get_misses += stats_get_misses;
+                STATS_UNLOCK();
                 out_string(c, "CLIENT_ERROR bad command line format");
                 return;
             }
 
-            STATS_LOCK();
-            stats.get_cmds++;
-            STATS_UNLOCK();
+            stats_get_cmds++;
             it = item_get(key, nkey);
             if (settings.detail_enabled) {
                 stats_prefix_record_get(key, NULL != it);
@@ -1152,27 +1281,62 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens)
                  *   key
                  *   " " + flags + " " + data length + "\r\n" + data (with \r\n)
                  */
-                if (add_iov(c, "VALUE ", 6) != 0 ||
-                    add_iov(c, ITEM_key(it), it->nkey) != 0 ||
-                    add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
-                    {
-                        break;
-                    }
+
+                if(return_cas == true)
+                {
+                  /* Goofy mid-flight realloc. */
+                  if (i >= c->suffixsize) {
+                    char **new_suffix_list = realloc(c->suffixlist,
+                                           sizeof(char *) * c->suffixsize * 2);
+                    if (new_suffix_list) {
+                      c->suffixsize *= 2;
+                      c->suffixlist  = new_suffix_list;
+                    } else break;
+                  }
+
+                  suffix = suffix_from_freelist();
+                  if (suffix == NULL) {
+                    STATS_LOCK();
+                    stats.get_cmds   += stats_get_cmds;
+                    stats.get_hits   += stats_get_hits;
+                    stats.get_misses += stats_get_misses;
+                    STATS_UNLOCK();
+                    out_string(c, "SERVER_ERROR out of memory");
+                    return;
+                  }
+                  *(c->suffixlist + i) = suffix;
+                  sprintf(suffix, " %llu\r\n", it->cas_id);
+                  if (add_iov(c, "VALUE ", 6) != 0 ||
+                      add_iov(c, ITEM_key(it), it->nkey) != 0 ||
+                      add_iov(c, ITEM_suffix(it), it->nsuffix - 2) != 0 ||
+                      add_iov(c, suffix, strlen(suffix)) != 0 ||
+                      add_iov(c, ITEM_data(it), it->nbytes) != 0)
+                      {
+                          break;
+                      }
+                }
+                else
+                {
+                  if (add_iov(c, "VALUE ", 6) != 0 ||
+                      add_iov(c, ITEM_key(it), it->nkey) != 0 ||
+                      add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
+                      {
+                          break;
+                      }
+                }
+
+
                 if (settings.verbose > 1)
                     fprintf(stderr, ">%d sending key %s\n", c->sfd, ITEM_key(it));
 
                 /* item_get() has incremented it->refcount for us */
-                STATS_LOCK();
-                stats.get_hits++;
-                STATS_UNLOCK();
+                stats_get_hits++;
                 item_update(it);
                 *(c->ilist + i) = it;
                 i++;
 
             } else {
-                STATS_LOCK();
-                stats.get_misses++;
-                STATS_UNLOCK();
+                stats_get_misses++;
             }
 
             key_token++;
@@ -1191,28 +1355,45 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens)
 
     c->icurr = c->ilist;
     c->ileft = i;
+    if (return_cas) {
+        c->suffixcurr = c->suffixlist;
+        c->suffixleft = i;
+    }
 
     if (settings.verbose > 1)
         fprintf(stderr, ">%d END\n", c->sfd);
-    add_iov(c, "END\r\n", 5);
 
-    if (c->udp && build_udp_headers(c) != 0) {
+    /*
+        If the loop was terminated because of out-of-memory, it is not
+        reliable to add END\r\n to the buffer, because it might not end
+        in \r\n. So we send SERVER_ERROR instead.
+    */
+    if (key_token->value != NULL || add_iov(c, "END\r\n", 5) != 0
+        || (c->udp && build_udp_headers(c) != 0)) {
         out_string(c, "SERVER_ERROR out of memory");
     }
     else {
         conn_set_state(c, conn_mwrite);
         c->msgcurr = 0;
     }
+
+    STATS_LOCK();
+    stats.get_cmds   += stats_get_cmds;
+    stats.get_hits   += stats_get_hits;
+    stats.get_misses += stats_get_misses;
+    STATS_UNLOCK();
+
     return;
 }
 
-static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm) {
+static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
     char *key;
     size_t nkey;
     int flags;
     time_t exptime;
-    int vlen;
-    item *it;
+    int vlen, old_vlen;
+    uint64_t req_cas_id;
+    item *it, *old_it;
 
     assert(c != NULL);
 
@@ -1227,6 +1408,12 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     flags = strtoul(tokens[2].value, NULL, 10);
     exptime = strtol(tokens[3].value, NULL, 10);
     vlen = strtol(tokens[4].value, NULL, 10);
+
+    // does cas value exist?
+    if(handle_cas)
+    {
+      req_cas_id = strtoull(tokens[5].value, NULL, 10);
+    }
 
     if(errno == ERANGE || ((flags == 0 || exptime == 0) && errno == EINVAL)) {
         out_string(c, "CLIENT_ERROR bad command line format");
@@ -1262,18 +1449,20 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         c->sbytes = vlen + 2;
         return;
     }
+    if(handle_cas)
+      it->cas_id = req_cas_id;
 
-    c->item_comm = comm;
     c->item = it;
     c->ritem = ITEM_data(it);
     c->rlbytes = it->nbytes;
+    c->item_comm = comm;
     conn_set_state(c, conn_nread);
 }
 
-static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const int incr) {
-    char temp[32];
+static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const bool incr) {
+    char temp[sizeof("18446744073709551615")];
     item *it;
-    unsigned int delta;
+    int64_t delta;
     char *key;
     size_t nkey;
 
@@ -1300,7 +1489,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
         }
     }
 
-    delta = strtoul(tokens[2].value, NULL, 10);
+    delta = strtoll(tokens[2].value, NULL, 10);
 
     if(errno == ERANGE) {
         out_string(c, "CLIENT_ERROR bad command line format");
@@ -1327,27 +1516,27 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
  *
  * returns a response string to send back to the client.
  */
-char *do_add_delta(item *it, int incr, unsigned int delta, char *buf) {
+char *do_add_delta(item *it, const bool incr, const int64_t delta, char *buf) {
     char *ptr;
-    unsigned int value;
+    int64_t value;
     int res;
 
     ptr = ITEM_data(it);
     while ((*ptr != '\0') && (*ptr < '0' && *ptr > '9')) ptr++;    // BUG: can't be true
 
-    value = strtol(ptr, NULL, 10);
+    value = strtoull(ptr, NULL, 10);
 
     if(errno == ERANGE) {
         return "CLIENT_ERROR cannot increment or decrement non-numeric value";
     }
 
-    if (incr != 0)
+    if (incr)
         value += delta;
     else {
         if (delta >= value) value = 0;
         else value -= delta;
     }
-    snprintf(buf, 32, "%u", value);
+    sprintf(buf, "%llu", value);
     res = strlen(buf);
     if (res + 2 > it->nbytes) { /* need to realloc */
         item *new_it;
@@ -1502,23 +1691,32 @@ static void process_command(conn *c, char *command) {
     }
 
     ntokens = tokenize_command(command, tokens, MAX_TOKENS);
-
     if (ntokens >= 3 &&
         ((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
          (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0))) {
 
-        process_get_command(c, tokens, ntokens);
+        process_get_command(c, tokens, ntokens, false);
 
     } else if (ntokens == 6 &&
                ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
                 (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) ||
-                (strcmp(tokens[COMMAND_TOKEN].value, "replace") == 0 && (comm = NREAD_REPLACE)))) {
+                (strcmp(tokens[COMMAND_TOKEN].value, "replace") == 0 && (comm = NREAD_REPLACE)) ||
+                (strcmp(tokens[COMMAND_TOKEN].value, "prepend") == 0 && (comm = NREAD_PREPEND)) ||
+                (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) )) {
 
-        process_update_command(c, tokens, ntokens, comm);
+        process_update_command(c, tokens, ntokens, comm, false);
+
+    } else if (ntokens == 7 && (strcmp(tokens[COMMAND_TOKEN].value, "cas") == 0 && (comm = NREAD_CAS))) {
+
+        process_update_command(c, tokens, ntokens, comm, true);
 
     } else if (ntokens == 4 && (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)) {
 
         process_arithmetic_command(c, tokens, ntokens, 1);
+
+    } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)) {
+
+        process_get_command(c, tokens, ntokens, true);
 
     } else if (ntokens == 4 && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
 
@@ -1946,7 +2144,7 @@ static void drive_machine(conn *c) {
                 break;
             }
             dispatch_conn_new(sfd, conn_read, EV_READ | EV_PERSIST,
-                              DATA_BUFFER_SIZE, false);
+                                     DATA_BUFFER_SIZE, false);
             break;
 
         case conn_read:
@@ -2086,6 +2284,15 @@ static void drive_machine(conn *c) {
                         item_remove(it);
                         c->icurr++;
                         c->ileft--;
+                    }
+                    while (c->suffixleft > 0) {
+                        char *suffix = *(c->suffixcurr);
+                        if(suffix_add_to_freelist(suffix)) {
+                            /* Failed to add to freelist, don't leak */
+                            free(suffix);
+                        }
+                        c->suffixcurr++;
+                        c->suffixleft--;
                     }
                     conn_set_state(c, conn_read);
                 } else if (c->state == conn_write) {
@@ -2317,12 +2524,13 @@ static int new_socket_unix(void) {
     return sfd;
 }
 
-static int server_socket_unix(const char *path) {
+static int server_socket_unix(const char *path, int access_mask) {
     int sfd;
     struct linger ling = {0, 0};
     struct sockaddr_un addr;
     struct stat tstat;
     int flags =1;
+    int old_umask;
 
     if (!path) {
         return -1;
@@ -2352,11 +2560,14 @@ static int server_socket_unix(const char *path) {
 
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, path);
+    old_umask=umask( ~(access_mask&0777));
     if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
         perror("bind()");
         close(sfd);
+        umask(old_umask);
         return -1;
     }
+    umask(old_umask);
     if (listen(sfd, 1024) == -1) {
         perror("listen()");
         close(sfd);
@@ -2458,6 +2669,7 @@ static void usage(void) {
     printf("-p <num>      TCP port number to listen on (default: 11211)\n"
            "-U <num>      UDP port number to listen on (default: 0, off)\n"
            "-s <file>     unix socket path to listen on (disables network support)\n"
+           "-a <mask>     access mask for unix socket, in octal (default 0700)\n"
            "-l <ip_addr>  interface to listen on, default is INDRR_ANY\n"
            "-d            run as a daemon\n"
            "-r            maximize core file limit\n"
@@ -2560,7 +2772,7 @@ static void save_pid(const pid_t pid, const char *pid_file) {
     if (pid_file == NULL)
         return;
 
-    if (!(fp = fopen(pid_file, "w"))) {
+    if ((fp = fopen(pid_file, "w")) == NULL) {
         fprintf(stderr, "Could not open the pid file %s for writing\n", pid_file);
         return;
     }
@@ -2620,7 +2832,7 @@ int main (int argc, char **argv) {
 #endif /* USE_REPLICATION */
 
     /* handle SIGINT */
-    signal(SIGINT,  sig_handler);
+    signal(SIGINT, sig_handler);
 #ifdef USE_REPLICATION
     signal(SIGTERM, sig_handler);
 #endif /* USE_REPLICATION */
@@ -2633,11 +2845,16 @@ int main (int argc, char **argv) {
 
     /* process arguments */
 #ifdef USE_REPLICATION
-    while ((c = getopt(argc, argv, "bp:s:U:m:Mc:khirvdl:u:P:f:s:n:t:D:X:x:")) != -1) {
+    while ((c = getopt(argc, argv, "a:bp:s:U:m:Mc:khirvdl:u:P:f:s:n:t:D:X:x:")) != -1) {
 #else
-    while ((c = getopt(argc, argv, "bp:s:U:m:Mc:khirvdl:u:P:f:s:n:t:D:")) != -1) {
+    while ((c = getopt(argc, argv, "a:bp:s:U:m:Mc:khirvdl:u:P:f:s:n:t:D:")) != -1) {
 #endif /* USE_REPLICATION */
         switch (c) {
+        case 'a':
+            /* access for unix domain socket, as octal mask (like chmod)*/
+            settings.access= strtol(optarg,NULL,8);
+            break;
+
         case 'U':
             settings.udpport = atoi(optarg);
             break;
@@ -2837,7 +3054,7 @@ int main (int argc, char **argv) {
 
     /* create unix mode sockets after dropping privileges */
     if (settings.socketpath != NULL) {
-        l_socket = server_socket_unix(settings.socketpath);
+        l_socket = server_socket_unix(settings.socketpath,settings.access);
         if (l_socket == -1) {
             fprintf(stderr, "failed to listen\n");
             exit(EXIT_FAILURE);
@@ -2855,6 +3072,7 @@ int main (int argc, char **argv) {
         }
     }
 
+
     /* initialize main thread libevent instance */
     main_base = event_init();
 
@@ -2863,6 +3081,8 @@ int main (int argc, char **argv) {
     stats_init();
     assoc_init();
     conn_init();
+    /* Hacky suffix buffers. */
+    suffix_init();
     slabs_init(settings.maxbytes, settings.factor);
 
     /* managed instance? alloc and zero a bucket array */
@@ -2908,17 +3128,21 @@ int main (int argc, char **argv) {
     }
 #endif /* USE_REPLICATION */
 
-    /* save the PID in if we're a daemon */
-    if (daemonize)
-        save_pid(getpid(), pid_file);
     /* start up worker threads if MT mode */
     thread_init(settings.num_threads, main_base);
+    /* save the PID in if we're a daemon, do this after thread_init due to
+       a file descriptor handling bug somewhere in libevent */
+    if (daemonize)
+        save_pid(getpid(), pid_file);
     /* initialise clock event */
     clock_handler(0, 0, 0);
     /* initialise deletion array and timer event */
     deltotal = 200;
     delcurr = 0;
-    todelete = malloc(sizeof(item *) * deltotal);
+    if ((todelete = malloc(sizeof(item *) * deltotal)) == NULL) {
+        perror("failed to allocate memory for deletion array");
+        exit(EXIT_FAILURE);
+    }
     delete_handler(0, 0, 0); /* sets up the event */
     /* create the initial listening udp connection, monitored on all threads */
     if (u_socket > -1) {
@@ -3211,7 +3435,6 @@ static int replication_send(conn *c)
     }
     return(c->wbytes);
 }
-
 
 static int replication_pop()
 {

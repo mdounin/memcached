@@ -14,6 +14,10 @@
 #include <malloc.h>
 #endif
 
+#ifdef HAVE_STRING_H
+#include <string.h>
+#endif
+
 #ifdef USE_THREADS
 
 #include <pthread.h>
@@ -42,6 +46,9 @@ struct conn_queue {
 
 /* Lock for connection freelist */
 static pthread_mutex_t conn_lock;
+
+/* Lock for alternative item suffix freelist */
+static pthread_mutex_t suffix_lock;
 
 /* Lock for cache operations (item_*, assoc_*) */
 static pthread_mutex_t cache_lock;
@@ -112,6 +119,7 @@ static CQ_ITEM *cq_pop(CQ *cq) {
 /*
  * Looks for an item on a connection queue, but doesn't block if there isn't
  * one.
+ * Returns the item, or NULL if no item is available
  */
 static CQ_ITEM *cq_peek(CQ *cq) {
     CQ_ITEM *item;
@@ -203,7 +211,7 @@ static void create_worker(void *(*func)(void *), void *arg) {
 
     pthread_attr_init(&attr);
 
-    if (ret = pthread_create(&thread, &attr, func, arg)) {
+    if ((ret = pthread_create(&thread, &attr, func, arg)) != 0) {
         fprintf(stderr, "Can't create thread: %s\n",
                 strerror(ret));
         exit(1);
@@ -230,8 +238,8 @@ conn *mt_conn_from_freelist() {
  *
  * Returns 0 on success, 1 if the structure couldn't be added.
  */
-int mt_conn_add_to_freelist(conn *c) {
-    int result;
+bool mt_conn_add_to_freelist(conn *c) {
+    bool result;
 
     pthread_mutex_lock(&conn_lock);
     result = do_conn_add_to_freelist(c);
@@ -239,6 +247,36 @@ int mt_conn_add_to_freelist(conn *c) {
 
     return result;
 }
+
+/*
+ * Pulls a suffix buffer from the freelist, if one is available.
+ */
+char *mt_suffix_from_freelist() {
+    char *s;
+
+    pthread_mutex_lock(&suffix_lock);
+    s = do_suffix_from_freelist();
+    pthread_mutex_unlock(&suffix_lock);
+
+    return s;
+}
+
+
+/*
+ * Adds a suffix buffer to the freelist.
+ *
+ * Returns 0 on success, 1 if the buffer couldn't be added.
+ */
+bool mt_suffix_add_to_freelist(char *s) {
+    bool result;
+
+    pthread_mutex_lock(&suffix_lock);
+    result = do_suffix_add_to_freelist(s);
+    pthread_mutex_unlock(&suffix_lock);
+
+    return result;
+}
+
 
 /****************************** LIBEVENT THREADS *****************************/
 
@@ -283,7 +321,7 @@ static void *worker_libevent(void *arg) {
     pthread_cond_signal(&init_cond);
     pthread_mutex_unlock(&init_lock);
 
-    event_base_loop(me->base, 0);
+    return (void*) event_base_loop(me->base, 0);
 }
 
 
@@ -300,22 +338,23 @@ static void thread_libevent_process(int fd, short which, void *arg) {
         if (settings.verbose > 0)
             fprintf(stderr, "Can't read from libevent pipe\n");
 
-    if (item = cq_peek(&me->new_conn_queue)) {
-    conn *c = conn_new(item->sfd, item->init_state, item->event_flags,
-                       item->read_buffer_size, item->is_udp, me->base);
-    if (!c) {
-        if (item->is_udp) {
-            fprintf(stderr, "Can't listen for events on UDP socket\n");
-            exit(1);
+    item = cq_peek(&me->new_conn_queue);
+
+    if (NULL != item) {
+        conn *c = conn_new(item->sfd, item->init_state, item->event_flags,
+                           item->read_buffer_size, item->is_udp, me->base);
+        if (c == NULL) {
+            if (item->is_udp) {
+                fprintf(stderr, "Can't listen for events on UDP socket\n");
+                exit(1);
+            } else {
+                if (settings.verbose > 0) {
+                    fprintf(stderr, "Can't listen for events on fd %d\n",
+                        item->sfd);
+                }
+                close(item->sfd);
             }
-        else {
-        if (settings.verbose > 0) {
-                fprintf(stderr, "Can't listen for events on fd %d\n",
-                    item->sfd);
         }
-        close(item->sfd);
-        }
-    }
         cqi_free(item);
     }
 }
@@ -381,23 +420,10 @@ item *mt_item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int n
  * Returns an item if it hasn't been marked as expired or deleted,
  * lazy-expiring as needed.
  */
-item *mt_item_get_notedeleted(char *key, size_t nkey, bool *delete_locked) {
+item *mt_item_get_notedeleted(const char *key, const size_t nkey, bool *delete_locked) {
     item *it;
     pthread_mutex_lock(&cache_lock);
     it = do_item_get_notedeleted(key, nkey, delete_locked);
-    pthread_mutex_unlock(&cache_lock);
-    return it;
-}
-
-/*
- * Returns an item whether or not it's been marked as expired or deleted.
- */
-item *mt_item_get_nocheck(char *key, size_t nkey) {
-    item *it;
-
-    pthread_mutex_lock(&cache_lock);
-    it = assoc_find(key, nkey);
-    it->refcount++;
     pthread_mutex_unlock(&cache_lock);
     return it;
 }
@@ -469,7 +495,7 @@ char *mt_defer_delete(item *item, time_t exptime) {
 /*
  * Does arithmetic on a numeric item value.
  */
-char *mt_add_delta(item *item, int incr, unsigned int delta, char *buf) {
+char *mt_add_delta(item *item, int incr, const int64_t delta, char *buf) {
     char *ret;
 
     pthread_mutex_lock(&cache_lock);
@@ -497,6 +523,42 @@ void mt_item_flush_expired() {
     pthread_mutex_lock(&cache_lock);
     do_item_flush_expired();
     pthread_mutex_unlock(&cache_lock);
+}
+
+/*
+ * Dumps part of the cache
+ */
+char *mt_item_cachedump(unsigned int slabs_clsid, unsigned int limit, unsigned int *bytes) {
+    char *ret;
+
+    pthread_mutex_lock(&cache_lock);
+    ret = do_item_cachedump(slabs_clsid, limit, bytes);
+    pthread_mutex_unlock(&cache_lock);
+    return ret;
+}
+
+/*
+ * Dumps statistics about slab classes
+ */
+char *mt_item_stats(int *bytes) {
+    char *ret;
+
+    pthread_mutex_lock(&cache_lock);
+    ret = do_item_stats(bytes);
+    pthread_mutex_unlock(&cache_lock);
+    return ret;
+}
+
+/*
+ * Dumps a list of objects of each size in 32-byte increments
+ */
+char *mt_item_stats_sizes(int *bytes) {
+    char *ret;
+
+    pthread_mutex_lock(&cache_lock);
+    ret = do_item_stats_sizes(bytes);
+    pthread_mutex_unlock(&cache_lock);
+    return ret;
 }
 
 /****************************** HASHTABLE MODULE *****************************/
@@ -562,7 +624,6 @@ void mt_stats_unlock() {
  */
 void thread_init(int nthreads, struct event_base *main_base) {
     int         i;
-    pthread_t   *thread;
 
     pthread_mutex_init(&cache_lock, NULL);
     pthread_mutex_init(&conn_lock, NULL);
@@ -604,7 +665,7 @@ void thread_init(int nthreads, struct event_base *main_base) {
 
     /* Wait for all the threads to set themselves up before returning. */
     pthread_mutex_lock(&init_lock);
-    init_count++; // main thread
+    init_count++; /* main thread */
     while (init_count < nthreads) {
         pthread_cond_wait(&init_cond, &init_lock);
     }

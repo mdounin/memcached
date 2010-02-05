@@ -15,7 +15,6 @@
 #include <sys/signal.h>
 #include <sys/resource.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <netinet/in.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -89,7 +88,7 @@ unsigned int slabs_clsid(const size_t size) {
     return res;
 }
 
-/*
+/**
  * Determines the chunk sizes and initializes the slab class descriptors
  * accordingly.
  */

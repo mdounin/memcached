@@ -18,4 +18,8 @@ ok($@, "Died with illegal -l args");
 eval {
     my $server = new_memcached("-l 127.0.0.1");
 };
-is($@,'', "-l 127.0.0.1 works");
+if (! support_replication()) {
+    is($@,'', "-l 127.0.0.1 works");
+} else {
+    ok($@, "-l 127.0.0.1 already in use");
+}
