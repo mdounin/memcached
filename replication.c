@@ -11,11 +11,16 @@
 static Q_ITEM *q_freelist  = NULL;
 static int     q_itemcount = 0;
 
-Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd)
+int get_qi_count()
 {
-    Q_ITEM *q = NULL;
-    char       *key;
-    int         keylen = 0;
+    return(q_itemcount);
+}
+
+Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd, bool reuse)
+{
+    Q_ITEM     *q      = NULL;
+    char       *key    = NULL;
+    uint32_t    keylen = 0;
     rel_time_t  time   = 0;
 
     if(q_freelist){
@@ -24,18 +29,22 @@ Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd)
     }
 
     if(NULL == q){
-        if(q_itemcount == Q_ITEM_MAX)
+        if(reuse)
+            return(NULL);
+        if(q_itemcount >= settings.rep_qmax)
             return(NULL);
         q = malloc(sizeof(Q_ITEM));
-        if (NULL == q)
+        if (NULL == q){
+            fprintf(stderr,"replication: qi_new out of memory\n");
             return(NULL);
+        }
         q_itemcount++;
-        if (settings.verbose > 1)
+        if (settings.verbose > 2)
             fprintf(stderr,"replication: alloc c=%d\n", q_itemcount);
     }
 
     switch (type) {
-    case REPLICATION_SET:
+    case REPLICATION_REP:
     case REPLICATION_DEL:
         key    = cmd->key;
         keylen = cmd->keylen;
@@ -50,8 +59,10 @@ Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd)
     case REPLICATION_DEFER_FLUSH_ALL:
         time   = cmd->time;
         break;
+    case REPLICATION_MARUGOTO_END:
+        break;
     default:
-        fprintf(stderr,"replication: got unknown command:%d\n", type);
+        fprintf(stderr,"replication: got unknown command: %d\n", type);
         return(NULL);
     }
 
@@ -59,8 +70,7 @@ Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd)
     q->type = type;
     q->time = time;
     q->next = NULL;
-
-    if (keylen > 0) {
+    if (keylen) {
         q->key = malloc(keylen + 1);
         if(NULL == q->key){
             qi_free(q);
@@ -70,6 +80,7 @@ Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd)
             *(q->key + keylen) = 0;
         }
     }
+
     return(q);
 }
 
@@ -102,20 +113,20 @@ int qi_free_list()
 static int replication_get_num(char *p, int n)
 {
     int  l;
-    char buff[64];
-
-    sprintf(buff, "%u", n);
-    l = strlen(buff);
-    if(p) memcpy(p, buff, l);
+    char b[64];
+    if(p)
+        l = sprintf(p, "%u", n);
+    else
+        l = sprintf(b, "%u", n);
     return(l);
 }
 
-int replication_call_set(char *key, size_t keylen)
+int replication_call_rep(char *key, size_t keylen)
 {
     R_CMD r;
     r.key    = key;
     r.keylen = keylen;
-    return(replication(REPLICATION_SET, &r));
+    return(replication(REPLICATION_REP, &r));
 }
 
 int replication_call_del(char *key, size_t keylen)
@@ -138,18 +149,41 @@ int replication_call_defer_del(char *key, size_t keylen, rel_time_t time)
 int replication_call_flush_all()
 {
     R_CMD r;
-    r.key    = NULL;
-    r.keylen = 0;
+    r.key = NULL;
     return(replication(REPLICATION_FLUSH_ALL, &r));
 }
 
 int replication_call_defer_flush_all(const rel_time_t time)
 {
     R_CMD r;
-    r.key    = NULL;
-    r.keylen = 0;
-    r.time   = time;
+    r.key  = NULL;
+    r.time = time;
     return(replication(REPLICATION_DEFER_FLUSH_ALL, &r));
+}
+
+int replication_call_marugoto_end()
+{
+    R_CMD r;
+    r.key = NULL;
+    return(replication(REPLICATION_MARUGOTO_END, &r));
+}
+
+static int replication_alloc(conn *c, int s)
+{
+    char *p;
+    s += c->wbytes;
+    if(c->wsize < s){
+        while(c->wsize < s)
+            c->wsize += 4096;
+        if(p = malloc(c->wsize)){
+            memcpy(p, c->wbuf, c->wbytes);
+            free(c->wbuf);
+            c->wbuf = p;
+        }else{
+            return(-1);
+        }
+    }
+    return(0);
 }
 
 static int replication_del(conn *c, char *k)
@@ -162,16 +196,9 @@ static int replication_del(conn *c, char *k)
     l += strlen(s);
     l += strlen(k);
     l += strlen(n);
-    if(c->wsize < c->wbytes + l){
-        if(p = malloc(c->wbytes + l)){
-            memcpy(p, c->wbuf, c->wbytes);
-            free(c->wbuf);
-            c->wbuf  = p;
-            c->wsize = c->wbytes + l;
-        }else{
-            fprintf(stderr, "replication: del malloc error\n");
-            return(-1);
-        }
+    if(replication_alloc(c,l) == -1){
+        fprintf(stderr, "replication: del malloc error\n");
+        return(-1);
     }
     p = c->wbuf + c->wbytes;
     memcpy(p, s, strlen(s));
@@ -197,16 +224,9 @@ static int replication_defer_del(conn *c, char *k, rel_time_t exp)
     l += 1;
     l += replication_get_num(NULL, exp);
     l += strlen(n);
-    if(c->wsize < c->wbytes + l){
-        if(p = malloc(c->wbytes + l)){
-            memcpy(p, c->wbuf, c->wbytes);
-            free(c->wbuf);
-            c->wbuf  = p;
-            c->wsize = c->wbytes + l;
-        }else{
-            fprintf(stderr, "replication: del malloc error\n");
-            return(-1);
-        }
+    if(replication_alloc(c,l) == -1){
+        fprintf(stderr, "replication: del malloc error\n");
+        return(-1);
     }
     p = c->wbuf + c->wbytes;
     memcpy(p, s, strlen(s));
@@ -222,18 +242,19 @@ static int replication_defer_del(conn *c, char *k, rel_time_t exp)
     return(0);
 }
 
-static int replication_set(conn *c, item *it)
+static int replication_rep(conn *c, item *it)
 {
     int   r = 0;
     int exp = 0;
     int len = 0;
-    char *s = "set ";
+    char *s = "rep ";
     char *n = "\r\n";
     char *p = NULL;
     char flag[40];
 
     if(it->exptime)
         exp = it->exptime + stats.started;
+    flag[0]=0;
     if(p=ITEM_suffix(it)){
         int i;
         memcpy(flag, p, it->nsuffix - 2);
@@ -254,21 +275,14 @@ static int replication_set(conn *c, item *it)
     len += replication_get_num(NULL, exp);
     len += 1;
     len += replication_get_num(NULL, it->nbytes - 2);
+    len += 1;
+    len += replication_get_num(NULL, it->cas_id);
     len += strlen(n);
     len += it->nbytes;
     len += strlen(n);
-    if(c->wsize < c->wbytes + len){
-        if(p = malloc(c->wbytes + len)){
-            memcpy(p, c->wbuf, c->wbytes);
-            free(c->wbuf);
-            c->wbuf  = p;
-            c->wsize = c->wbytes + len;
-            if (settings.verbose > 1)
-                fprintf(stderr, "replication: get malloc ok\n");
-        }else{
-            fprintf(stderr, "replication: get malloc error\n");
-            return(-1);
-        }
+    if(replication_alloc(c,len) == -1){
+        fprintf(stderr, "replication: rep malloc error\n");
+        return(-1);
     }
     p = c->wbuf + c->wbytes;
     memcpy(p, s, strlen(s));
@@ -282,6 +296,8 @@ static int replication_set(conn *c, item *it)
     p += replication_get_num(p, exp);
     *(p++) = ' ';
     p += replication_get_num(p, it->nbytes - 2);
+    *(p++) = ' ';
+    p += replication_get_num(p, it->cas_id);
     memcpy(p, n, strlen(n));
     p += strlen(n);
     memcpy(p, ITEM_data(it), it->nbytes);
@@ -293,30 +309,17 @@ static int replication_set(conn *c, item *it)
 
 static int replication_flush_all(conn *c, rel_time_t exp)
 {
-    int len = 0;
     char *s = "flush_all ";
     char *n = "\r\n";
     char *p = NULL;
 
-    len += strlen(s);
+    int l = strlen(s) + strlen(n);
     if (exp > 0)
-        len += replication_get_num(NULL, exp);
-    len += strlen(n);
-
-    if(c->wsize < c->wbytes + len){
-        if(p = malloc(c->wbytes + len)){
-            memcpy(p, c->wbuf, c->wbytes);
-            free(c->wbuf);
-            c->wbuf  = p;
-            c->wsize = c->wbytes + len;
-            if (settings.verbose > 1)
-                fprintf(stderr, "replication: flush_all malloc ok\n");
-        }else{
-            fprintf(stderr, "replication: flush_all malloc error\n");
-            return(-1);
-        }
+        l += replication_get_num(NULL, exp);
+    if(replication_alloc(c,l) == -1){
+        fprintf(stderr, "replication: flush_all malloc error\n");
+        return(-1);
     }
-
     p = c->wbuf + c->wbytes;
     memcpy(p, s, strlen(s));
     p += strlen(s);
@@ -324,7 +327,27 @@ static int replication_flush_all(conn *c, rel_time_t exp)
         p += replication_get_num(p, exp);
     memcpy(p, n, strlen(n));
     p += strlen(n);
+    c->wbytes = p - c->wbuf;
+    c->wcurr  = c->wbuf;
+    return(0);
+}
 
+static int replication_marugoto_end(conn *c)
+{
+    char *s = "marugoto_end";
+    char *n = "\r\n";
+    char *p = NULL;
+
+    int l = strlen(s) + strlen(n);
+    if(replication_alloc(c,l) == -1){
+        fprintf(stderr, "replication: marugoto_end malloc error\n");
+        return(-1);
+    }
+    p = c->wbuf + c->wbytes;
+    memcpy(p, s, strlen(s));
+    p += strlen(s);
+    memcpy(p, n, strlen(n));
+    p += strlen(n);
     c->wbytes = p - c->wbuf;
     c->wcurr  = c->wbuf;
     return(0);
@@ -332,12 +355,11 @@ static int replication_flush_all(conn *c, rel_time_t exp)
 
 int replication_cmd(conn *c, Q_ITEM *q)
 {
-    item *i;
-
+    item *it;
     switch (q->type) {
-    case REPLICATION_SET:
-        if(i = assoc_find(q->key, strlen(q->key)))
-            return(replication_set(c, i));
+    case REPLICATION_REP:
+        if(it = assoc_find(q->key, strlen(q->key)))
+            return(replication_rep(c, it));
         else
             return(replication_del(c, q->key));
     case REPLICATION_DEL:
@@ -348,9 +370,10 @@ int replication_cmd(conn *c, Q_ITEM *q)
         return(replication_flush_all(c, 0));
     case REPLICATION_DEFER_FLUSH_ALL:
         return(replication_flush_all(c, q->time));
+    case REPLICATION_MARUGOTO_END:
+        return(replication_marugoto_end(c));
     default:
         fprintf(stderr,"replication: got unknown command:%d\n", q->type);
         return(0);
     }
 }
-

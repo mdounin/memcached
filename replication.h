@@ -1,16 +1,15 @@
 #ifndef MEMCACHED_REPLICATION_H
 #define MEMCACHED_REPLICATION_H
+#define REPCACHED_VERSION "2.0"
 #include <netdb.h>
-#define REP_BACKUP 0
-#define REP_MASTER 1
-#define Q_ITEM_MAX 1024
 
 enum CMD_TYPE {
-  REPLICATION_SET,
+  REPLICATION_REP,
   REPLICATION_DEL,
   REPLICATION_DEFER_DEL,
   REPLICATION_FLUSH_ALL,
   REPLICATION_DEFER_FLUSH_ALL,
+  REPLICATION_MARUGOTO_END,
 };
 
 typedef struct queue_item_t Q_ITEM;
@@ -28,9 +27,10 @@ struct replication_cmd_t {
   rel_time_t  time;
 };
 
-Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd);
+Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd, bool);
 void    qi_free(Q_ITEM *);
 int     qi_free_list();
 int     replication_cmd(conn *, Q_ITEM *);
+int     get_qi_count();
 
 #endif

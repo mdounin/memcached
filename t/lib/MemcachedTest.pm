@@ -159,8 +159,8 @@ sub version2num {
 }
 
 sub new_memcached {
-    my $args = shift || "";
-    my $port = free_port();
+    my ($args, $passed_port) = @_;
+    my $port = $passed_port || free_port();
     my $udpport = free_port("udp");
     $args .= " -p $port";
     if (supports_udp()) {

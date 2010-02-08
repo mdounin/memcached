@@ -40,7 +40,7 @@ my $stats = mem_stats($sock);
 if (! support_replication()) {
     is(scalar(keys(%$stats)), 22, "22 stats values");
 } else {
-    is(scalar(keys(%$stats)), 23, "23 stats values");
+    is(scalar(keys(%$stats)), 25, "25 stats values");
 }
 
 # Test initial state

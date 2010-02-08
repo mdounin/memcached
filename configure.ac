@@ -1,5 +1,5 @@
 AC_PREREQ(2.52)
-AC_INIT(memcached, 1.2.4, brad@danga.com)
+AC_INIT(memcached, 1.2.5, brad@danga.com)
 AC_CANONICAL_SYSTEM
 AC_CONFIG_SRCDIR(memcached.c)
 AM_INIT_AUTOMAKE(AC_PACKAGE_NAME, AC_PACKAGE_VERSION)
@@ -8,6 +8,23 @@ AM_CONFIG_HEADER(config.h)
 AC_PROG_CC
 AM_PROG_CC_C_O
 AC_PROG_INSTALL
+
+AC_ARG_ENABLE(64bit,
+  [AS_HELP_STRING([--enable-64bit],[build 64bit verison])])
+if test "x$enable_64bit" == "xyes"
+then
+    org_cflags=$CFLAGS
+    CFLAGS=-m64
+    AC_RUN_IFELSE(
+      [AC_LANG_PROGRAM([], [dnl
+return sizeof(void*) == 8 ? 0 : 1;
+      ])
+    ],[
+      CFLAGS="-m64 $org_cflags"
+    ],[
+    AC_MSG_ERROR([Don't know how to build a 64-bit object.])
+    ])
+fi
 
 trylibeventdir=""
 AC_ARG_WITH(libevent,
@@ -95,7 +112,6 @@ dnl ----------------------------------------------------------------------------
 AC_SEARCH_LIBS(socket, socket)
 AC_SEARCH_LIBS(gethostbyname, nsl)
 AC_SEARCH_LIBS(mallinfo, malloc)
-AC_SEARCH_LIBS(pthread_create, pthread)
 
 AC_CHECK_FUNC(daemon,AC_DEFINE([HAVE_DAEMON],,[Define this if you have daemon()]),[AC_LIBOBJ(daemon)])
 
@@ -160,12 +176,27 @@ AC_C_ENDIAN
 
 dnl Check whether the user wants threads or not
 AC_ARG_ENABLE(threads,
-  [AS_HELP_STRING([--enable-threads],[support multithreaded execution])],
-  [if test "$ac_cv_search_pthread_create" != "no"; then
+  [AS_HELP_STRING([--enable-threads],[support multithreaded execution])])
+if test "x$enable_threads" == "xyes"; then
+  AC_SEARCH_LIBS(pthread_create, pthread)
+  if test "x$ac_cv_search_pthread_create" != "xno"; then
     AC_DEFINE([USE_THREADS],,[Define this if you want to use pthreads])
-   else
+    dnl Sun compilers need the -mt flag!
+    AC_RUN_IFELSE(
+      [AC_LANG_PROGRAM([], [dnl
+#ifdef __SUNPRO_C
+   return 0;
+#else
+   return 1;
+#endif
+      ])
+    ],[
+      CFLAGS="-mt $CFLAGS"
+    ])
+  else
     AC_MSG_ERROR([Can't enable threads without the POSIX thread library.])
-   fi])
+  fi
+fi
 
 dnl Check whether the user wants replication or not
 AC_ARG_ENABLE(replication,
@@ -180,6 +211,8 @@ AC_ARG_ENABLE(replication,
 AM_CONDITIONAL(ENABLE_REPLICATION, test "x$enable_replication" = "xyes")
 
 AC_CHECK_FUNCS(mlockall)
+AC_CHECK_FUNCS(getpagesizes)
+AC_CHECK_FUNCS(memcntl)
 
 AC_CONFIG_FILES(Makefile doc/Makefile)
 AC_OUTPUT

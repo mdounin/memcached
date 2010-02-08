@@ -10,6 +10,7 @@
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <event.h>
+#include <netdb.h>
 
 #define DATA_BUFFER_SIZE 2048
 #define UDP_READ_BUFFER_SIZE 65536
@@ -83,7 +84,7 @@ struct settings {
     int maxconns;
     int port;
     int udpport;
-    struct in_addr interf;
+    char *inter;
     int verbose;
     rel_time_t oldest_live; /* ignore existing items older than this */
     bool managed;          /* if 1, a tracker manages virtual buckets */
@@ -98,8 +99,8 @@ struct settings {
 #ifdef USE_REPLICATION
     struct in_addr rep_addr;    /* replication addr */
     int rep_port;               /* replication port */
-    int rep_mode;               /* Master/Backup    */
-#endif
+    int rep_qmax;               /* replication QITEM max */
+#endif /*USE_REPLICATION*/
 };
 
 extern struct stats stats;
@@ -110,6 +111,10 @@ extern struct settings settings;
 
 /* temp */
 #define ITEM_SLABBED 4
+
+#ifdef USE_REPLICATION
+#define ITEM_REPDATA 128
+#endif /*USE_REPLICATION*/
 
 typedef struct _stritem {
     struct _stritem *next;
@@ -144,15 +149,13 @@ enum conn_states {
     conn_nread,      /** reading in a fixed number of bytes */
     conn_swallow,    /** swallowing unnecessary bytes w/o storing */
     conn_closing,    /** closing this connection */
-#ifdef USE_REPLICATION
     conn_mwrite,     /** writing out many items sequentially */
+#ifdef USE_REPLICATION
     conn_repconnect, /* replication */
+    conn_rep_listen, /* */
+    conn_rep_send,   /* */
     conn_pipe_recv,  /* */
     conn_pipe_send,  /* */
-    conn_rep_recv,   /* */
-    conn_rep_send    /* */
-#else
-    conn_mwrite,     /** writing out many items sequentially */
 #endif /* USE_REPLICATION */
 };
 
@@ -163,7 +166,8 @@ enum conn_states {
 #define NREAD_PREPEND 5
 #define NREAD_CAS 6
 
-typedef struct {
+typedef struct conn conn;
+struct conn {
     int    sfd;
     int    state;
     struct event event;
@@ -232,17 +236,15 @@ typedef struct {
     int    bucket;    /* bucket number for the next command, if running as
                          a managed instance. -1 (_not_ 0) means invalid. */
     int    gen;       /* generation requested for the bucket */
-} conn;
+    bool   noreply;   /* True if the reply should not be sent. */
+    conn   *next;     /* Used for generating a list of conn structures */
+};
 
 /* number of virtual buckets for a managed instance */
 #define MAX_BUCKETS 32768
 
 /* current time of day (updated periodically) */
 extern volatile rel_time_t current_time;
-
-/* temporary hack */
-/* #define assert(x) if(!(x)) { printf("assert failure: %s\n", #x); pre_gdb(); }
-   void pre_gdb (); */
 
 /*
  * Functions
@@ -308,8 +310,8 @@ char *mt_item_stats_sizes(int *bytes);
 void  mt_item_unlink(item *it);
 void  mt_item_update(item *it);
 void  mt_run_deferred_deletes(void);
-void *mt_slabs_alloc(size_t size);
-void  mt_slabs_free(void *ptr, size_t size);
+void *mt_slabs_alloc(size_t size, unsigned int id);
+void  mt_slabs_free(void *ptr, size_t size, unsigned int id);
 int   mt_slabs_reassign(unsigned char srcid, unsigned char dstid);
 char *mt_slabs_stats(int *buflen);
 void  mt_stats_lock(void);
@@ -337,8 +339,8 @@ int   mt_store_item(item *item, int comm);
 # define item_update(x)              mt_item_update(x)
 # define item_unlink(x)              mt_item_unlink(x)
 # define run_deferred_deletes()      mt_run_deferred_deletes()
-# define slabs_alloc(x)              mt_slabs_alloc(x)
-# define slabs_free(x,y)             mt_slabs_free(x,y)
+# define slabs_alloc(x,y)            mt_slabs_alloc(x,y)
+# define slabs_free(x,y,z)           mt_slabs_free(x,y,z)
 # define slabs_reassign(x,y)         mt_slabs_reassign(x,y)
 # define slabs_stats(x)              mt_slabs_stats(x)
 # define store_item(x,y)             mt_store_item(x,y)
@@ -370,8 +372,8 @@ int   mt_store_item(item *item, int comm);
 # define item_unlink(x)              do_item_unlink(x)
 # define item_update(x)              do_item_update(x)
 # define run_deferred_deletes()      do_run_deferred_deletes()
-# define slabs_alloc(x)              do_slabs_alloc(x)
-# define slabs_free(x,y)             do_slabs_free(x,y)
+# define slabs_alloc(x,y)            do_slabs_alloc(x,y)
+# define slabs_free(x,y,z)           do_slabs_free(x,y,z)
 # define slabs_reassign(x,y)         do_slabs_reassign(x,y)
 # define slabs_stats(x)              do_slabs_stats(x)
 # define store_item(x,y)             do_store_item(x,y)
@@ -382,4 +384,10 @@ int   mt_store_item(item *item, int comm);
 
 #endif /* !USE_THREADS */
 
+/* If supported, give compiler hints for branch prediction. */
+#if !defined(__GNUC__) || (__GNUC__ == 2 && __GNUC_MINOR__ < 96)
+#define __builtin_expect(x, expected_value) (x)
+#endif
 
+#define likely(x)       __builtin_expect((x),1)
+#define unlikely(x)     __builtin_expect((x),0)

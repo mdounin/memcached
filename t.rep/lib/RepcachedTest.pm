@@ -15,8 +15,8 @@ our $REP_LAG = 0.8;
 sub new_repcached() {
     my ($port_master,$port_backup,$port_rep) = (free_port(),free_port(),free_port());
     return (
-        new_memcached("-l 127.0.0.1 -p $port_master -x 127.0.0.1 -X $port_rep"),
-        new_memcached("-l 127.0.0.1 -p $port_backup -x 127.0.0.1 -X $port_rep"),
+        new_memcached("-l 127.0.0.1 -x 127.0.0.1 -X $port_rep", $port_master),
+        new_memcached("-l 127.0.0.1 -x 127.0.0.1 -X $port_rep", $port_backup),
        );
 }
 

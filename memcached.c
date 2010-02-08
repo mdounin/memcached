@@ -19,7 +19,7 @@ std *
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/signal.h>
+#include <signal.h>
 #include <sys/resource.h>
 #include <sys/uio.h>
 
@@ -63,7 +63,7 @@ std *
  * forward declarations
  */
 static void drive_machine(conn *c);
-static int new_socket(const bool is_udp);
+static int new_socket(struct addrinfo *ai);
 static int server_socket(const int port, const bool is_udp);
 static int try_read_command(conn *c);
 static int try_read_network(conn *c);
@@ -94,27 +94,28 @@ static void set_current_time(void);  /* update the global variable holding
                               global 32-bit seconds-since-start time
                               (to avoid 64 bit time_t) */
 
-void pre_gdb(void);
 static void conn_free(conn *c);
 
 #ifdef USE_REPLICATION
 static int   rep_exit = 0;
-static char *rep_rs[] = {"STORED\r\n", "DELETED\r\n", "NOT_FOUND\r\n", "OK\r\n", NULL};
 static conn *rep_recv = NULL;
 static conn *rep_send = NULL;
 static conn *rep_conn = NULL;
-static int replication_master_init();
-static int replication_backup_init();
-static int replication_init();
-static int replication_connect();
-static int replication_close();
-static int replication_marugoto(int);
-static int replication_recv(conn *);
-static int replication_send(conn *);
-static int replication_pop();
-static int replication_push();
-static int replication_exit();
-static int replication_item(Q_ITEM *);
+static conn *rep_serv = NULL;
+static int  server_socket_replication(const int);
+static void server_close_replication();
+static int  replication_init();
+static int  replication_server_init();
+static int  replication_client_init();
+static int  replication_start();
+static int  replication_connect();
+static int  replication_close();
+static int  replication_marugoto(int);
+static int  replication_send(conn *);
+static int  replication_pop();
+static int  replication_push();
+static int  replication_exit();
+static int  replication_item(Q_ITEM *);
 int replication(enum CMD_TYPE type, R_CMD *cmd);
 #endif /* USE_REPLICATION */
 
@@ -126,7 +127,7 @@ struct settings settings;
 static item **todelete = NULL;
 static int delcurr;
 static int deltotal;
-static conn *listen_conn;
+static conn *listen_conn = NULL;
 static struct event_base *main_base;
 
 #define TRANSMIT_COMPLETE   0
@@ -188,7 +189,8 @@ static void settings_init(void) {
     settings.access=0700;
     settings.port = 11211;
     settings.udpport = 0;
-    settings.interf.s_addr = htonl(INADDR_ANY);
+    /* By default this string should be NULL for getaddrinfo() */
+    settings.inter = NULL;
     settings.maxbytes = 64 * 1024 * 1024; /* default is 64MB */
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
@@ -208,7 +210,7 @@ static void settings_init(void) {
 #ifdef USE_REPLICATION
     settings.rep_addr.s_addr = htonl(INADDR_ANY);
     settings.rep_port = 11212;
-    settings.rep_mode = REP_MASTER;
+    settings.rep_qmax = 8192;
 #endif /* USE_REPLICATION */
 }
 
@@ -276,7 +278,7 @@ static void conn_init(void) {
     freetotal = 200;
     freecurr = 0;
     if ((freeconns = (conn **)malloc(sizeof(conn *) * freetotal)) == NULL) {
-        perror("malloc()");
+        fprintf(stderr, "malloc()\n");
     }
     return;
 }
@@ -324,7 +326,7 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
 
     if (NULL == c) {
         if (!(c = (conn *)malloc(sizeof(conn)))) {
-            perror("malloc()");
+            fprintf(stderr, "malloc()\n");
             return NULL;
         }
         c->rbuf = c->wbuf = 0;
@@ -358,7 +360,7 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
             if (c->iov != 0) free(c->iov);
             if (c->msglist != 0) free(c->msglist);
             free(c);
-            perror("malloc()");
+            fprintf(stderr, "malloc()\n");
             return NULL;
         }
 
@@ -373,11 +375,8 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
         else if (is_udp)
             fprintf(stderr, "<%d server listening (udp)\n", sfd);
 #ifdef USE_REPLICATION
-        else if (init_state == conn_repconnect)
-            if(settings.rep_mode == REP_MASTER)
+        else if (init_state == conn_rep_listen)
                 fprintf(stderr, "<%d server listening (replication)\n", sfd);
-            else
-                fprintf(stderr, "<%d new client connection (replication)\n", sfd);
 #endif /* USE_REPLICATION */
         else
             fprintf(stderr, "<%d new client connection\n", sfd);
@@ -405,6 +404,8 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
     c->bucket = -1;
     c->gen = 0;
 
+    c->noreply = false;
+
     event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
     event_base_set(base, &c->event);
     c->ev_flags = event_flags;
@@ -413,6 +414,7 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
         if (conn_add_to_freelist(c)) {
             conn_free(c);
         }
+        perror("event_add");
         return NULL;
     }
 
@@ -496,12 +498,6 @@ static void conn_close(conn *c) {
     STATS_LOCK();
     stats.curr_conns--;
     STATS_UNLOCK();
-
-#ifdef USE_REPLICATION
-    if((settings.rep_mode == REP_BACKUP) && (c == rep_conn)){
-        replication_master_init();
-    }
-#endif /* USE_REPLICATION */
     return;
 }
 
@@ -595,7 +591,7 @@ static void suffix_init(void) {
 
     freesuffix = (char **)malloc( sizeof(char *) * freesuffixtotal );
     if (freesuffix == NULL) {
-        perror("malloc()");
+        fprintf(stderr, "malloc()\n");
     }
     return;
 }
@@ -770,6 +766,22 @@ static void out_string(conn *c, const char *str) {
 
     assert(c != NULL);
 
+#ifdef USE_REPLICATION
+    if (c == rep_conn){
+        if (settings.verbose > 1)
+            fprintf(stderr, "REP>%d %s\n", c->sfd, str);
+        conn_set_state(c, conn_read);
+        return;
+    }
+#endif /* USE_REPLICATION */
+    if (c->noreply) {
+        if (settings.verbose > 1)
+            fprintf(stderr, ">%d NOREPLY %s\n", c->sfd, str);
+        c->noreply = false;
+        conn_set_state(c, conn_read);
+        return;
+    }
+
     if (settings.verbose > 1)
         fprintf(stderr, ">%d %s\n", c->sfd, str);
 
@@ -811,7 +823,16 @@ static void complete_nread(conn *c) {
     } else {
       ret = store_item(it, comm);
       if (ret == 1)
+#ifdef USE_REPLICATION
+      {
+          if( c != rep_conn ){
+            replication_call_rep(ITEM_key(it), it->nkey);
+          }
           out_string(c, "STORED");
+      }
+#else
+          out_string(c, "STORED");
+#endif /* USE_REPLICATION */
       else if(ret == 2)
           out_string(c, "EXISTS");
       else if(ret == 3)
@@ -862,9 +883,6 @@ int do_store_item(item *it, int comm) {
         else if(it->cas_id == old_it->cas_id) {
           // cas validates
           do_item_replace(old_it, it);
-#ifdef USE_REPLICATION
-          replication_call_set(ITEM_key(it), it->nkey);
-#endif /* USE_REPLICATION */
           stored = 1;
         }
         else
@@ -917,9 +935,6 @@ int do_store_item(item *it, int comm) {
         else
             do_item_link(it);
 
-#ifdef USE_REPLICATION
-        replication_call_set(ITEM_key(it), it->nkey);
-#endif /* USE_REPLICATION */
         stored = 1;
     }
 
@@ -941,7 +956,7 @@ typedef struct token_s {
 #define KEY_TOKEN 1
 #define KEY_MAX_LENGTH 250
 
-#define MAX_TOKENS 7
+#define MAX_TOKENS 8
 
 /*
  * Tokenize the command string by replacing whitespace with '\0' and update
@@ -1007,7 +1022,24 @@ static void write_and_free(conn *c, char *buf, int bytes) {
         conn_set_state(c, conn_write);
         c->write_and_go = conn_read;
     } else {
-        out_string(c, "SERVER_ERROR out of memory");
+        out_string(c, "SERVER_ERROR out of memory writing stats");
+    }
+}
+
+static inline void set_noreply_maybe(conn *c, token_t *tokens, size_t ntokens)
+{
+    int noreply_index = ntokens - 2;
+
+    /*
+      NOTE: this function is not the first place where we are going to
+      send the reply.  We could send it instead from process_command()
+      if the request line has wrong number of tokens.  However parsing
+      malformed line for "noreply" option is not reliable anyway, so
+      it can't be helped.
+    */
+    if (tokens[noreply_index].value
+        && strcmp(tokens[noreply_index].value, "noreply") == 0) {
+        c->noreply = true;
     }
 }
 
@@ -1082,11 +1114,10 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         pos += sprintf(pos, "STAT limit_maxbytes %llu\r\n", (uint64_t) settings.maxbytes);
         pos += sprintf(pos, "STAT threads %u\r\n", settings.num_threads);
 #ifdef USE_REPLICATION
-        if(settings.rep_mode == REP_MASTER)
-            pos += sprintf(pos, "STAT replication MASTER\r\n");
-        if(settings.rep_mode == REP_BACKUP)
-            pos += sprintf(pos, "STAT replication BACKUP\r\n");
-#endif /* USE_REPLICATION */
+        pos += sprintf(pos, "STAT replication MASTER\r\n");
+        pos += sprintf(pos, "STAT repcached_version %s\r\n", REPCACHED_VERSION);
+        pos += sprintf(pos, "STAT repcached_qi_free %u\r\n", settings.rep_qmax - get_qi_count());
+#endif /*USE_REPLICATION*/
         pos += sprintf(pos, "END");
         STATS_UNLOCK();
         out_string(c, temp);
@@ -1133,7 +1164,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         int res;
 
         if ((wbuf = (char *)malloc(wsize)) == NULL) {
-            out_string(c, "SERVER_ERROR out of memory");
+            out_string(c, "SERVER_ERROR out of memory writing stats maps");
             return;
         }
 
@@ -1300,7 +1331,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                     stats.get_hits   += stats_get_hits;
                     stats.get_misses += stats_get_misses;
                     STATS_UNLOCK();
-                    out_string(c, "SERVER_ERROR out of memory");
+                    out_string(c, "SERVER_ERROR out of memory making CAS suffix");
                     return;
                   }
                   *(c->suffixlist + i) = suffix;
@@ -1369,7 +1400,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
     */
     if (key_token->value != NULL || add_iov(c, "END\r\n", 5) != 0
         || (c->udp && build_udp_headers(c) != 0)) {
-        out_string(c, "SERVER_ERROR out of memory");
+        out_string(c, "SERVER_ERROR out of memory writing get response");
     }
     else {
         conn_set_state(c, conn_mwrite);
@@ -1396,8 +1427,10 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 
     assert(c != NULL);
 
+    set_noreply_maybe(c, tokens, ntokens);
+
     if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
-        out_string(c, "CLIENT_ERROR bad command line format");
+        out_string(c, "CLIENT_ERROR bad command line format!");
         return;
     }
 
@@ -1408,15 +1441,14 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     exptime = strtol(tokens[3].value, NULL, 10);
     vlen = strtol(tokens[4].value, NULL, 10);
 
-    // does cas value exist?
-    if(handle_cas)
-    {
-      req_cas_id = strtoull(tokens[5].value, NULL, 10);
+    if(errno == ERANGE || ((flags == 0 || exptime == 0) && errno == EINVAL)) {
+        out_string(c, "CLIENT_ERROR bad command line format!!");
+        return;
     }
 
-    if(errno == ERANGE || ((flags == 0 || exptime == 0) && errno == EINVAL)) {
-        out_string(c, "CLIENT_ERROR bad command line format");
-        return;
+    // does cas value exist?
+    if(handle_cas) {
+      req_cas_id = strtoull(tokens[5].value, NULL, 10);
     }
 
     if (settings.detail_enabled) {
@@ -1442,7 +1474,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         if (! item_size_ok(nkey, flags, vlen + 2))
             out_string(c, "SERVER_ERROR object too large for cache");
         else
-            out_string(c, "SERVER_ERROR out of memory");
+            out_string(c, "SERVER_ERROR out of memory storing object");
         /* swallow the data line */
         c->write_and_go = conn_swallow;
         c->sbytes = vlen + 2;
@@ -1467,8 +1499,10 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
 
     assert(c != NULL);
 
+    set_noreply_maybe(c, tokens, ntokens);
+
     if(tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
-        out_string(c, "CLIENT_ERROR bad command line format");
+        out_string(c, "CLIENT_ERROR bad command line format!!!");
         return;
     }
 
@@ -1491,7 +1525,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
     delta = strtoll(tokens[2].value, NULL, 10);
 
     if(errno == ERANGE) {
-        out_string(c, "CLIENT_ERROR bad command line format");
+        out_string(c, "CLIENT_ERROR bad command line format!!!!");
         return;
     }
 
@@ -1502,6 +1536,11 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
     }
 
     out_string(c, add_delta(it, incr, delta, temp));
+#ifdef USE_REPLICATION
+    if( c != rep_conn){
+        replication_call_rep(ITEM_key(it), it->nkey);
+    }
+#endif /* USE_REPLICATION */
     item_remove(it);         /* release our reference */
 }
 
@@ -1541,21 +1580,15 @@ char *do_add_delta(item *it, const bool incr, const int64_t delta, char *buf) {
         item *new_it;
         new_it = do_item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2 );
         if (new_it == 0) {
-            return "SERVER_ERROR out of memory";
+            return "SERVER_ERROR out of memory in incr/decr";
         }
         memcpy(ITEM_data(new_it), buf, res);
         memcpy(ITEM_data(new_it) + res, "\r\n", 3);
         do_item_replace(it, new_it);
-#ifdef USE_REPLICATION
-        replication_call_set(ITEM_key(it), it->nkey);
-#endif /* USE_REPLICATION */
         do_item_remove(new_it);       /* release our reference */
     } else { /* replace in-place */
         memcpy(ITEM_data(it), buf, res);
         memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
-#ifdef USE_REPLICATION
-        replication_call_set(ITEM_key(it), it->nkey);
-#endif /* USE_REPLICATION */
     }
 
     return buf;
@@ -1568,6 +1601,8 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
     time_t exptime = 0;
 
     assert(c != NULL);
+
+    set_noreply_maybe(c, tokens, ntokens);
 
     if (settings.managed) {
         int bucket = c->bucket;
@@ -1586,15 +1621,15 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
     nkey = tokens[KEY_TOKEN].length;
 
     if(nkey > KEY_MAX_LENGTH) {
-        out_string(c, "CLIENT_ERROR bad command line format");
+        out_string(c, "CLIENT_ERROR bad command line format!!!!!");
         return;
     }
 
-    if(ntokens == 4) {
+    if(ntokens == (c->noreply ? 5 : 4)) {
         exptime = strtol(tokens[2].value, NULL, 10);
 
         if(errno == ERANGE) {
-            out_string(c, "CLIENT_ERROR bad command line format");
+            out_string(c, "CLIENT_ERROR bad command line format!!!!!!");
             return;
         }
     }
@@ -1609,13 +1644,15 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
             item_unlink(it);
             item_remove(it);      /* release our reference */
 #ifdef USE_REPLICATION
-            replication_call_del(key, nkey);
+            if( c != rep_conn )
+                replication_call_del(key, nkey);
 #endif /* USE_REPLICATION */
             out_string(c, "DELETED");
         } else {
             /* our reference will be transfered to the delete queue */
 #ifdef USE_REPLICATION
-            replication_call_defer_del(key, nkey, realtime(exptime) + stats.started);
+            if( c != rep_conn )
+                replication_call_defer_del(key, nkey, realtime(exptime) + stats.started);
 #endif /* USE_REPLICATION */
             out_string(c, defer_delete(it, exptime));
         }
@@ -1642,7 +1679,7 @@ char *do_defer_delete(item *it, time_t exptime)
              * but we ran out of memory for the delete queue
              */
             item_remove(it);    /* release reference */
-            return "SERVER_ERROR out of memory";
+            return "SERVER_ERROR out of memory expanding delete queue";
         }
     }
 
@@ -1658,6 +1695,8 @@ static void process_verbosity_command(conn *c, token_t *tokens, const size_t nto
     unsigned int level;
 
     assert(c != NULL);
+
+    set_noreply_maybe(c, tokens, ntokens);
 
     level = strtoul(tokens[1].value, NULL, 10);
     settings.verbose = level > MAX_VERBOSITY_LEVEL ? MAX_VERBOSITY_LEVEL : level;
@@ -1685,7 +1724,7 @@ static void process_command(conn *c, char *command) {
     c->msgused = 0;
     c->iovused = 0;
     if (add_msghdr(c) != 0) {
-        out_string(c, "SERVER_ERROR out of memory");
+        out_string(c, "SERVER_ERROR out of memory preparing response");
         return;
     }
 
@@ -1696,7 +1735,7 @@ static void process_command(conn *c, char *command) {
 
         process_get_command(c, tokens, ntokens, false);
 
-    } else if (ntokens == 6 &&
+    } else if ((ntokens == 6 || ntokens == 7) &&
                ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
                 (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) ||
                 (strcmp(tokens[COMMAND_TOKEN].value, "replace") == 0 && (comm = NREAD_REPLACE)) ||
@@ -1705,11 +1744,26 @@ static void process_command(conn *c, char *command) {
 
         process_update_command(c, tokens, ntokens, comm, false);
 
-    } else if (ntokens == 7 && (strcmp(tokens[COMMAND_TOKEN].value, "cas") == 0 && (comm = NREAD_CAS))) {
+    } else if ((ntokens == 7 || ntokens == 8) && (strcmp(tokens[COMMAND_TOKEN].value, "cas") == 0 && (comm = NREAD_CAS))) {
 
         process_update_command(c, tokens, ntokens, comm, true);
 
-    } else if (ntokens == 4 && (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)) {
+#ifdef USE_REPLICATION
+    } else if ((ntokens == 7) && (strcmp(tokens[COMMAND_TOKEN].value, "rep") == 0 && (comm = NREAD_SET)) && (c == rep_conn)) {
+
+        process_update_command(c, tokens, ntokens, comm, true);
+        if(c->item)
+            ((item *)(c->item))->it_flags |= ITEM_REPDATA;
+
+    } else if ((ntokens == 2) && (strcmp(tokens[COMMAND_TOKEN].value, "marugoto_end") == 0) && (c == rep_conn)) {
+        if(replication_start() == -1)
+            exit(EXIT_FAILURE);
+        if (settings.verbose > 0)
+            fprintf(stderr,"replication: start\n");
+        return;
+
+#endif /* USE_REPLICATION */
+    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)) {
 
         process_arithmetic_command(c, tokens, ntokens, 1);
 
@@ -1717,11 +1771,11 @@ static void process_command(conn *c, char *command) {
 
         process_get_command(c, tokens, ntokens, true);
 
-    } else if (ntokens == 4 && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
+    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
 
         process_arithmetic_command(c, tokens, ntokens, 0);
 
-    } else if (ntokens >= 3 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
+    } else if (ntokens >= 3 && ntokens <= 5 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
 
         process_delete_command(c, tokens, ntokens);
 
@@ -1790,13 +1844,16 @@ static void process_command(conn *c, char *command) {
 
         process_stat(c, tokens, ntokens);
 
-    } else if (ntokens >= 2 && ntokens <= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0)) {
+    } else if (ntokens >= 2 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0)) {
         time_t exptime = 0;
         set_current_time();
 
-        if(ntokens == 2) {
+        set_noreply_maybe(c, tokens, ntokens);
+
+        if(ntokens == (c->noreply ? 3 : 2)) {
 #ifdef USE_REPLICATION
-            replication_call_flush_all();
+            if( c != rep_conn )
+                replication_call_flush_all();
 #endif
             settings.oldest_live = current_time - 1;
             item_flush_expired();
@@ -1806,14 +1863,25 @@ static void process_command(conn *c, char *command) {
 
         exptime = strtol(tokens[1].value, NULL, 10);
         if(errno == ERANGE) {
-            out_string(c, "CLIENT_ERROR bad command line format");
+            out_string(c, "CLIENT_ERROR bad command line format!!!!!!!!");
             return;
         }
 
 #ifdef USE_REPLICATION
-        replication_call_defer_flush_all(realtime(exptime) + stats.started);
+        if( c != rep_conn )
+            replication_call_defer_flush_all(realtime(exptime) + stats.started);
 #endif
         settings.oldest_live = realtime(exptime) - 1;
+        /*
+          If exptime is zero realtime() would return zero too, and
+          realtime(exptime) - 1 would overflow to the max unsigned
+          value.  So we process exptime == 0 the same way we do when
+          no delay is given at all.
+        */
+        if (exptime > 0)
+            settings.oldest_live = realtime(exptime) - 1;
+        else /* exptime == 0 */
+            settings.oldest_live = current_time - 1;
         item_flush_expired();
         out_string(c, "OK");
         return;
@@ -1856,7 +1924,7 @@ static void process_command(conn *c, char *command) {
 #else
         out_string(c, "CLIENT_ERROR Slab reassignment not supported");
 #endif
-    } else if (ntokens == 3 && (strcmp(tokens[COMMAND_TOKEN].value, "verbosity") == 0)) {
+    } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "verbosity") == 0)) {
         process_verbosity_command(c, tokens, ntokens);
     } else {
         out_string(c, "ERROR");
@@ -1960,7 +2028,7 @@ static int try_read_network(conn *c) {
                 if (settings.verbose > 0)
                     fprintf(stderr, "Couldn't realloc input buffer\n");
                 c->rbytes = 0; /* ignore what we read */
-                out_string(c, "SERVER_ERROR out of memory");
+                out_string(c, "SERVER_ERROR out of memory reading request");
                 c->write_and_go = conn_closing;
                 return 1;
             }
@@ -1977,14 +2045,19 @@ static int try_read_network(conn *c) {
             c->request_addr_size = 0;
         }
 
-        res = read(c->sfd, c->rbuf + c->rbytes, c->rsize - c->rbytes);
+        int avail = c->rsize - c->rbytes;
+        res = read(c->sfd, c->rbuf + c->rbytes, avail);
         if (res > 0) {
             STATS_LOCK();
             stats.bytes_read += res;
             STATS_UNLOCK();
             gotdata = 1;
             c->rbytes += res;
-            continue;
+            if (res == avail) {
+                continue;
+            } else {
+                break;
+            }
         }
         if (res == 0) {
             /* connection closed */
@@ -1993,7 +2066,9 @@ static int try_read_network(conn *c) {
         }
         if (res == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            else return 0;
+            /* Should close on unhandled errors. */
+            conn_set_state(c, conn_closing);
+            return 1;
         }
     }
     return gotdata;
@@ -2017,20 +2092,25 @@ static bool update_event(conn *c, const int new_flags) {
  * Sets whether we are listening for new connections or not.
  */
 void accept_new_conns(const bool do_accept) {
+    conn *next;
+
     if (! is_listen_thread())
         return;
-    if (do_accept) {
-        update_event(listen_conn, EV_READ | EV_PERSIST);
-        if (listen(listen_conn->sfd, 1024) != 0) {
-            perror("listen");
+
+    for (next = listen_conn; next; next = next->next) {
+        if (do_accept) {
+            update_event(next, EV_READ | EV_PERSIST);
+            if (listen(next->sfd, 1024) != 0) {
+                perror("listen");
+            }
         }
-    }
-    else {
-        update_event(listen_conn, 0);
-        if (listen(listen_conn->sfd, 0) != 0) {
-            perror("listen");
+        else {
+            update_event(next, 0);
+            if (listen(next->sfd, 0) != 0) {
+                perror("listen");
+            }
         }
-    }
+  }
 }
 
 
@@ -2105,13 +2185,13 @@ static void drive_machine(conn *c) {
     bool stop = false;
     int sfd, flags = 1;
     socklen_t addrlen;
-    struct sockaddr addr;
+    struct sockaddr_storage addr;
     int res;
 
     assert(c != NULL);
 
 #ifdef USE_REPLICATION
-    if(rep_exit && (c->state != conn_pipe_recv) && (c->state != conn_rep_recv)){
+    if(rep_exit && (c->state != conn_pipe_recv)){
         return;
     }
 #endif /* USE_REPLICATION */
@@ -2121,7 +2201,7 @@ static void drive_machine(conn *c) {
         switch(c->state) {
         case conn_listening:
             addrlen = sizeof(addr);
-            if ((sfd = accept(c->sfd, &addr, &addrlen)) == -1) {
+            if ((sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen)) == -1) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     /* these are transient, so don't log anything */
                     stop = true;
@@ -2320,6 +2400,10 @@ static void drive_machine(conn *c) {
         case conn_closing:
             if (c->udp)
                 conn_cleanup(c);
+#ifdef USE_REPLICATION
+            else if(c == rep_conn)
+                replication_close();
+#endif /*USE_REPLICATION*/
             else
                 conn_close(c);
             stop = true;
@@ -2335,51 +2419,52 @@ static void drive_machine(conn *c) {
             stop = true;
             break;
 
-        case conn_rep_recv:
-            replication_recv(c);
-            stop = true;
-            break;
-
-        case conn_repconnect:
-            if(settings.rep_mode == REP_MASTER){
-                if (settings.verbose > 0)
-                    fprintf(stderr,"replication: accept\n");
-                addrlen = sizeof(addr);
-                res = accept(c->sfd, &addr, &addrlen);
-                if(res == -1){
-                    if(errno == EAGAIN || errno == EWOULDBLOCK) {
-                    } else if (errno == EMFILE) {
-                        fprintf(stderr, "replication: Too many opened connections\n");
-                    } else {
-                        fprintf(stderr, "replication: accept error\n");
-                    }
+        case conn_rep_listen:
+            if (settings.verbose > 0)
+                fprintf(stderr,"replication: accept\n");
+            addrlen = sizeof(addr);
+            res = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+            if(res == -1){
+                if(errno == EAGAIN || errno == EWOULDBLOCK) {
+                } else if (errno == EMFILE) {
+                    fprintf(stderr, "replication: Too many opened connections\n");
+                } else {
+                    fprintf(stderr, "replication: accept error\n");
+                }
+            }else{
+                if(rep_conn){
+                    close(res);
+                    fprintf(stderr,"replication: already connected\n");
                 }else{
-                    if(rep_conn){
+                    if((flags = fcntl(res, F_GETFL, 0)) < 0 || fcntl(res, F_SETFL, flags | O_NONBLOCK) < 0){
                         close(res);
-                        fprintf(stderr,"replication: already connected\n");
+                        fprintf(stderr, "replication: Can't Setting O_NONBLOCK\n");
                     }else{
-                        replication_marugoto(1);
-                        rep_conn = dispatch_conn_new(res, conn_rep_recv, EV_READ | EV_PERSIST, DATA_BUFFER_SIZE, false);
+                        server_close_replication();
+                        rep_conn = dispatch_conn_new(res, conn_read, EV_READ | EV_PERSIST, DATA_BUFFER_SIZE, false);
                         rep_conn->item   = NULL;
                         rep_conn->rbytes = 0;
                         rep_conn->rcurr  = rep_conn->rbuf;
                         replication_connect();
+                        replication_marugoto(1);
+                        replication_marugoto(0);
                     }
                 }
-                stop = true;
             }
-            if(settings.rep_mode == REP_BACKUP){
-                rep_conn = c;
-                conn_set_state(c, conn_read);
-                if (settings.verbose > 0)
-                    fprintf(stderr,"replication: connect\n");
-                if(update_event(c, EV_READ | EV_PERSIST)){
-                    stop = true;
-                }else{
-                    fprintf(stderr, "replication: Couldn't update event\n");
-                    conn_set_state(c, conn_closing);
-                }
+            stop = true;
+            break;
+
+        case conn_repconnect:
+            rep_conn = c;
+            replication_connect();
+            conn_set_state(c, conn_read);
+            if (settings.verbose > 0)
+                fprintf(stderr,"replication: marugoto copying\n");
+            if(!update_event(c, EV_READ | EV_PERSIST)){
+                fprintf(stderr, "replication: Couldn't update event\n");
+                conn_set_state(c, conn_closing);
             }
+            stop = true;
             break;
 #endif /* USE_REPLICATION */
         }
@@ -2410,11 +2495,11 @@ void event_handler(const int fd, const short which, void *arg) {
     return;
 }
 
-static int new_socket(const bool is_udp) {
+static int new_socket(struct addrinfo *ai) {
     int sfd;
     int flags;
 
-    if ((sfd = socket(AF_INET, is_udp ? SOCK_DGRAM : SOCK_STREAM, 0)) == -1) {
+    if ((sfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)) == -1) {
         perror("socket()");
         return -1;
     }
@@ -2463,46 +2548,106 @@ static void maximize_sndbuf(const int sfd) {
         fprintf(stderr, "<%d send buffer was %d, now %d\n", sfd, old_size, last_good);
 }
 
-
 static int server_socket(const int port, const bool is_udp) {
     int sfd;
     struct linger ling = {0, 0};
-    struct sockaddr_in addr;
+    struct addrinfo *ai;
+    struct addrinfo *next;
+    struct addrinfo hints;
+    char port_buf[NI_MAXSERV];
+    int error;
+    int success = 0;
+
     int flags =1;
-
-    if ((sfd = new_socket(is_udp)) == -1) {
-        return -1;
-    }
-
-    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
-    if (is_udp) {
-        maximize_sndbuf(sfd);
-    } else {
-        setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
-        setsockopt(sfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
-        setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
-    }
 
     /*
      * the memset call clears nonstandard fields in some impementations
      * that otherwise mess things up.
      */
-    memset(&addr, 0, sizeof(addr));
+    memset(&hints, 0, sizeof (hints));
+    hints.ai_flags = AI_PASSIVE|AI_ADDRCONFIG;
+    if (is_udp)
+    {
+        hints.ai_protocol = IPPROTO_UDP;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_family = AF_INET; /* This left here because of issues with OSX 10.5 */
+    } else {
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_protocol = IPPROTO_TCP;
+        hints.ai_socktype = SOCK_STREAM;
+    }
 
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr = settings.interf;
-    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-        perror("bind()");
-        close(sfd);
-        return -1;
+    snprintf(port_buf, NI_MAXSERV, "%d", port);
+    error= getaddrinfo(settings.inter, port_buf, &hints, &ai);
+    if (error != 0) {
+      if (error != EAI_SYSTEM)
+        fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
+      else
+        perror("getaddrinfo()");
+
+      return 1;
     }
-    if (!is_udp && listen(sfd, 1024) == -1) {
-        perror("listen()");
-        close(sfd);
-        return -1;
+
+    for (next= ai; next; next= next->ai_next) {
+        conn *listen_conn_add;
+        if ((sfd = new_socket(next)) == -1) {
+            freeaddrinfo(ai);
+            return 1;
+        }
+
+        setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
+        if (is_udp) {
+            maximize_sndbuf(sfd);
+        } else {
+            setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+            setsockopt(sfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
+            setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
+        }
+
+        if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
+            if (errno != EADDRINUSE) {
+                perror("bind()");
+                close(sfd);
+                freeaddrinfo(ai);
+                return 1;
+            }
+            close(sfd);
+            continue;
+        } else {
+          success++;
+          if (!is_udp && listen(sfd, 1024) == -1) {
+              perror("listen()");
+              close(sfd);
+              freeaddrinfo(ai);
+              return 1;
+          }
+      }
+
+      if (is_udp)
+      {
+        int c;
+
+        for (c = 0; c < settings.num_threads; c++) {
+            /* this is guaranteed to hit all threads because we round-robin */
+            dispatch_conn_new(sfd, conn_read, EV_READ | EV_PERSIST,
+                              UDP_READ_BUFFER_SIZE, 1);
+        }
+      } else {
+        if (!(listen_conn_add = conn_new(sfd, conn_listening,
+                                         EV_READ | EV_PERSIST, 1, false, main_base))) {
+            fprintf(stderr, "failed to create listening connection\n");
+            exit(EXIT_FAILURE);
+        }
+
+        listen_conn_add->next = listen_conn;
+        listen_conn = listen_conn_add;
+      }
     }
-    return sfd;
+
+    freeaddrinfo(ai);
+
+    /* Return zero iff we detected no errors in starting up connections */
+    return success == 0;
 }
 
 static int new_socket_unix(void) {
@@ -2532,11 +2677,11 @@ static int server_socket_unix(const char *path, int access_mask) {
     int old_umask;
 
     if (!path) {
-        return -1;
+        return 1;
     }
 
     if ((sfd = new_socket_unix()) == -1) {
-        return -1;
+        return 1;
     }
 
     /*
@@ -2564,31 +2709,106 @@ static int server_socket_unix(const char *path, int access_mask) {
         perror("bind()");
         close(sfd);
         umask(old_umask);
-        return -1;
+        return 1;
     }
     umask(old_umask);
     if (listen(sfd, 1024) == -1) {
         perror("listen()");
         close(sfd);
-        return -1;
+        return 1;
     }
-    return sfd;
+    if (!(listen_conn = conn_new(sfd, conn_listening,
+                                     EV_READ | EV_PERSIST, 1, false, main_base))) {
+        fprintf(stderr, "failed to create listening connection\n");
+        exit(EXIT_FAILURE);
+    }
+
+    return 0;
 }
 
-/* listening socket */
-static int l_socket = 0;
+#ifdef USE_REPLICATION
+static int server_socket_replication(const int port) {
+    int sfd;
+    struct linger ling = {0, 0};
+    struct addrinfo *ai;
+    struct addrinfo *next;
+    struct addrinfo hints;
+    char port_buf[NI_MAXSERV];
+    int error;
+    int success = 0;
 
-/* udp socket */
-static int u_socket = -1;
+    int flags =1;
 
-/* invoke right before gdb is called, on assert */
-void pre_gdb(void) {
-    int i;
-    if (l_socket > -1) close(l_socket);
-    if (u_socket > -1) close(u_socket);
-    for (i = 3; i <= 500; i++) close(i); /* so lame */
-    kill(getpid(), SIGABRT);
+    memset(&hints, 0, sizeof (hints));
+    hints.ai_flags = AI_PASSIVE|AI_ADDRCONFIG;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_socktype = SOCK_STREAM;
+    snprintf(port_buf, NI_MAXSERV, "%d", port);
+    error= getaddrinfo(settings.inter, port_buf, &hints, &ai);
+    if (error != 0) {
+      if (error != EAI_SYSTEM)
+        fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
+      else
+        perror("getaddrinfo()");
+
+      return 1;
+    }
+
+    for (next= ai; next; next= next->ai_next) {
+        conn *rep_serv_add;
+        if ((sfd = new_socket(next)) == -1) {
+            freeaddrinfo(ai);
+            return 1;
+        }
+        setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
+        setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+        setsockopt(sfd, SOL_SOCKET, SO_LINGER,    (void *)&ling,  sizeof(ling));
+        setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
+
+        if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
+            if (errno != EADDRINUSE) {
+                perror("bind()");
+                close(sfd);
+                freeaddrinfo(ai);
+                return 1;
+            }
+            close(sfd);
+            continue;
+        } else {
+            success++;
+            if (listen(sfd, 1024) == -1) {
+                perror("listen()");
+                close(sfd);
+                freeaddrinfo(ai);
+                return 1;
+            }
+        }
+
+        if (!(rep_serv_add = conn_new(sfd, conn_rep_listen,
+                                       EV_READ | EV_PERSIST, 1, false, main_base))) {
+            fprintf(stderr, "failed to create replication server connection\n");
+            exit(EXIT_FAILURE);
+        }
+
+        rep_serv_add->next = rep_serv;
+        rep_serv = rep_serv_add;
+    }
+
+    freeaddrinfo(ai);
+
+    /* Return zero iff we detected no errors in starting up connections */
+    return success == 0;
 }
+
+static void server_close_replication() {
+  conn *next=rep_serv;
+  while(rep_serv){
+      conn_close(rep_serv);
+      rep_serv = rep_serv->next;
+  }
+}
+#endif /* USE_REPLICATION */
 
 /*
  * We keep the current time of day in a global variable that's updated by a
@@ -2603,7 +2823,10 @@ static struct event clockevent;
 
 /* time-sensitive callers can call it by hand with this, outside the normal ever-1-second timer */
 static void set_current_time(void) {
-    current_time = (rel_time_t) (time(0) - stats.started);
+    struct timeval timer;
+
+    gettimeofday(&timer, NULL);
+    current_time = (rel_time_t) (timer.tv_sec - stats.started);
 }
 
 static void clock_handler(const int fd, const short which, void *arg) {
@@ -2665,6 +2888,9 @@ void do_run_deferred_deletes(void)
 
 static void usage(void) {
     printf(PACKAGE " " VERSION "\n");
+#ifdef USE_REPLICATION
+    printf("repcached %s\n",REPCACHED_VERSION);
+#endif /* USE_REPLICATION */
     printf("-p <num>      TCP port number to listen on (default: 11211)\n"
            "-U <num>      UDP port number to listen on (default: 0, off)\n"
            "-s <file>     unix socket path to listen on (disables network support)\n"
@@ -2676,7 +2902,12 @@ static void usage(void) {
            "-m <num>      max memory to use for items in megabytes, default is 64 MB\n"
            "-M            return error on memory exhausted (rather than removing items)\n"
            "-c <num>      max simultaneous connections, default is 1024\n"
-           "-k            lock down all paged memory\n"
+           "-k            lock down all paged memory.  Note that there is a\n"
+           "              limit on how much memory you may lock.  Trying to\n"
+           "              allocate more than that would fail, so be sure you\n"
+           "              set the limit correctly for the user you started\n"
+           "              the daemon with (not for -u <username> user;\n"
+           "              under sh this is done with 'ulimit -S -l NUM_KB').\n"
            "-v            verbose (print errors/warnings while in event loop)\n"
            "-vv           very verbose (also print client commands/reponses)\n"
            "-h            print this help and exit\n"
@@ -2684,11 +2915,21 @@ static void usage(void) {
            "-b            run a managed instanced (mnemonic: buckets)\n"
            "-P <file>     save PID in <file>, only used with -d option\n"
            "-f <factor>   chunk size growth factor, default 1.25\n"
-           "-n <bytes>    minimum space allocated for key+value+flags, default 48\n");
-#ifdef USE_REPLICATION
-    printf("-x <ip_addr>  hostname or IP address of the master replication server \n");
-    printf("-X <num>      TCP port number of the master (default: 11212)\n");
+           "-n <bytes>    minimum space allocated for key+value+flags, default 48\n"
+
+#if defined(HAVE_GETPAGESIZES) && defined(HAVE_MEMCNTL)
+           "-L            Try to use large memory pages (if available). Increasing\n"
+           "              the memory page size could reduce the number of TLB misses\n"
+           "              and improve the performance. In order to get large pages\n"
+           "              from the OS, memcached will allocate the total item-cache\n"
+           "              in one large chunk.\n"
 #endif
+           );
+
+#ifdef USE_REPLICATION
+    printf("-x <ip_addr>  hostname or IP address of peer repcached\n");
+    printf("-X <num>      TCP port number for replication (default: 11212)\n");
+#endif /* USE_REPLICATION */
 #ifdef USE_THREADS
     printf("-t <num>      number of threads to use, default 4\n");
 #endif
@@ -2814,11 +3055,53 @@ static void sig_handler(const int sig) {
 #endif /* USE_REPLICATION */
 }
 
+#if defined(HAVE_GETPAGESIZES) && defined(HAVE_MEMCNTL)
+/*
+ * On systems that supports multiple page sizes we may reduce the
+ * number of TLB-misses by using the biggest available page size
+ */
+int enable_large_pages(void) {
+    int ret = -1;
+    size_t sizes[32];
+    int avail = getpagesizes(sizes, 32);
+    if (avail != -1) {
+        size_t max = sizes[0];
+        struct memcntl_mha arg = {0};
+        int ii;
+
+        for (ii = 1; ii < avail; ++ii) {
+            if (max < sizes[ii]) {
+                max = sizes[ii];
+            }
+        }
+
+        arg.mha_flags   = 0;
+        arg.mha_pagesize = max;
+        arg.mha_cmd = MHA_MAPSIZE_BSSBRK;
+
+        if (memcntl(0, 0, MC_HAT_ADVISE, (caddr_t)&arg, 0, 0) == -1) {
+            fprintf(stderr, "Failed to set large pages: %s\n",
+                    strerror(errno));
+            fprintf(stderr, "Will use default page size\n");
+        } else {
+            ret = 0;
+        }
+    } else {
+        fprintf(stderr, "Failed to get supported pagesizes: %s\n",
+                strerror(errno));
+        fprintf(stderr, "Will use default page size\n");
+    }
+
+    return ret;
+}
+#endif
+
 int main (int argc, char **argv) {
     int c;
-    struct in_addr addr;
+    int x;
     bool lock_memory = false;
     bool daemonize = false;
+    bool preallocate = false;
     int maxcore = 0;
     char *username = NULL;
     char *pid_file = NULL;
@@ -2826,9 +3109,16 @@ int main (int argc, char **argv) {
     struct sigaction sa;
     struct rlimit rlim;
 #ifdef USE_REPLICATION
+    struct in_addr   addr;
     struct addrinfo  master_hint;
     struct addrinfo *master_addr;
 #endif /* USE_REPLICATION */
+    /* listening socket */
+    static int *l_socket = NULL;
+
+    /* udp socket */
+    static int *u_socket = NULL;
+    static int u_socket_count = 0;
 
     /* handle SIGINT */
     signal(SIGINT, sig_handler);
@@ -2844,9 +3134,9 @@ int main (int argc, char **argv) {
 
     /* process arguments */
 #ifdef USE_REPLICATION
-    while ((c = getopt(argc, argv, "a:bp:s:U:m:Mc:khirvdl:u:P:f:s:n:t:D:X:x:")) != -1) {
+    while ((c = getopt(argc, argv, "a:bp:s:U:m:Mc:khirvdl:u:P:f:s:n:t:D:LX:x:q:")) != -1) {
 #else
-    while ((c = getopt(argc, argv, "a:bp:s:U:m:Mc:khirvdl:u:P:f:s:n:t:D:")) != -1) {
+    while ((c = getopt(argc, argv, "a:bp:s:U:m:Mc:khirvdl:u:P:f:s:n:t:D:L")) != -1) {
 #endif /* USE_REPLICATION */
         switch (c) {
         case 'a':
@@ -2888,12 +3178,7 @@ int main (int argc, char **argv) {
             settings.verbose++;
             break;
         case 'l':
-            if (inet_pton(AF_INET, optarg, &addr) <= 0) {
-                fprintf(stderr, "Illegal address: %s\n", optarg);
-                return 1;
-            } else {
-                settings.interf = addr;
-            }
+            settings.inter= strdup(optarg);
             break;
         case 'd':
             daemonize = true;
@@ -2957,7 +3242,17 @@ int main (int argc, char **argv) {
         case 'X':
             settings.rep_port = atoi(optarg);
             break;
+        case 'q':
+            settings.rep_qmax = atoi(optarg);
+            break;
 #endif /* USE_REPLICATION */
+#if defined(HAVE_GETPAGESIZES) && defined(HAVE_MEMCNTL)
+        case 'L' :
+            if (enable_large_pages() == 0) {
+                preallocate = true;
+            }
+            break;
+#endif
         default:
             fprintf(stderr, "Illegal argument \"%c\"\n", c);
             return 1;
@@ -3010,29 +3305,17 @@ int main (int argc, char **argv) {
         }
     }
 
-    /*
-     * initialization order: first create the listening sockets
-     * (may need root on low ports), then drop root if needed,
-     * then daemonise if needed, then init libevent (in some cases
-     * descriptors created by libevent wouldn't survive forking).
-     */
-
-    /* create the listening socket and bind it */
-    if (settings.socketpath == NULL) {
-        l_socket = server_socket(settings.port, 0);
-        if (l_socket == -1) {
-            fprintf(stderr, "failed to listen\n");
-            exit(EXIT_FAILURE);
+    /* lock paged memory if needed */
+    if (lock_memory) {
+#ifdef HAVE_MLOCKALL
+        int res = mlockall(MCL_CURRENT | MCL_FUTURE);
+        if (res != 0) {
+            fprintf(stderr, "warning: -k invalid, mlockall() failed: %s\n",
+                    strerror(errno));
         }
-    }
-
-    if (settings.udpport > 0 && settings.socketpath == NULL) {
-        /* create the UDP listening socket and bind it */
-        u_socket = server_socket(settings.udpport, 1);
-        if (u_socket == -1) {
-            fprintf(stderr, "failed to listen on UDP port %d\n", settings.udpport);
-            exit(EXIT_FAILURE);
-        }
+#else
+        fprintf(stderr, "warning: -k invalid, mlockall() not supported on this platform.  proceeding without.\n");
+#endif
     }
 
     /* lose root privileges if we have them */
@@ -3048,15 +3331,6 @@ int main (int argc, char **argv) {
         if (setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0) {
             fprintf(stderr, "failed to assume identity of user %s\n", username);
             return 1;
-        }
-    }
-
-    /* create unix mode sockets after dropping privileges */
-    if (settings.socketpath != NULL) {
-        l_socket = server_socket_unix(settings.socketpath,settings.access);
-        if (l_socket == -1) {
-            fprintf(stderr, "failed to listen\n");
-            exit(EXIT_FAILURE);
         }
     }
 
@@ -3082,7 +3356,7 @@ int main (int argc, char **argv) {
     conn_init();
     /* Hacky suffix buffers. */
     suffix_init();
-    slabs_init(settings.maxbytes, settings.factor);
+    slabs_init(settings.maxbytes, settings.factor, preallocate);
 
     /* managed instance? alloc and zero a bucket array */
     if (settings.managed) {
@@ -3092,15 +3366,6 @@ int main (int argc, char **argv) {
             exit(EXIT_FAILURE);
         }
         memset(buckets, 0, sizeof(int) * MAX_BUCKETS);
-    }
-
-    /* lock paged memory if needed */
-    if (lock_memory) {
-#ifdef HAVE_MLOCKALL
-        mlockall(MCL_CURRENT | MCL_FUTURE);
-#else
-        fprintf(stderr, "warning: mlockall() not supported on this platform.  proceeding without.\n");
-#endif
     }
 
     /*
@@ -3114,18 +3379,6 @@ int main (int argc, char **argv) {
         perror("failed to ignore SIGPIPE; sigaction");
         exit(EXIT_FAILURE);
     }
-    /* create the initial listening connection */
-    if (!(listen_conn = conn_new(l_socket, conn_listening,
-                                 EV_READ | EV_PERSIST, 1, false, main_base))) {
-        fprintf(stderr, "failed to create listening connection");
-        exit(EXIT_FAILURE);
-    }
-
-#ifdef USE_REPLICATION
-    if(replication_init() == -1){
-        exit(EXIT_FAILURE);
-    }
-#endif /* USE_REPLICATION */
 
     /* start up worker threads if MT mode */
     thread_init(settings.num_threads, main_base);
@@ -3143,93 +3396,164 @@ int main (int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
     delete_handler(0, 0, 0); /* sets up the event */
-    /* create the initial listening udp connection, monitored on all threads */
-    if (u_socket > -1) {
-        for (c = 0; c < settings.num_threads; c++) {
-            /* this is guaranteed to hit all threads because we round-robin */
-            dispatch_conn_new(u_socket, conn_read, EV_READ | EV_PERSIST,
-                              UDP_READ_BUFFER_SIZE, 1);
+
+#ifdef USE_REPLICATION
+    if(replication_init() == -1){
+        fprintf(stderr, "faild to replication init\n");
+        exit(EXIT_FAILURE);
+    }
+#else
+    /* create unix mode sockets after dropping privileges */
+    if (settings.socketpath != NULL) {
+        if (server_socket_unix(settings.socketpath,settings.access)) {
+          fprintf(stderr, "failed to listen\n");
+          exit(EXIT_FAILURE);
         }
     }
+
+    /* create the listening socket, bind it, and init */
+    if (settings.socketpath == NULL) {
+        int udp_port;
+
+        if (server_socket(settings.port, 0)) {
+            fprintf(stderr, "failed to listen\n");
+            exit(EXIT_FAILURE);
+        }
+        /*
+         * initialization order: first create the listening sockets
+         * (may need root on low ports), then drop root if needed,
+         * then daemonise if needed, then init libevent (in some cases
+         * descriptors created by libevent wouldn't survive forking).
+         */
+        udp_port = settings.udpport ? settings.udpport : settings.port;
+
+        /* create the UDP listening socket and bind it */
+        if (server_socket(udp_port, 1)) {
+            fprintf(stderr, "failed to listen on UDP port %d\n", settings.udpport);
+            exit(EXIT_FAILURE);
+        }
+    }
+#endif /* USE_REPLICATION */
+
     /* enter the event loop */
     event_base_loop(main_base, 0);
     /* remove the PID file if we're a daemon */
     if (daemonize)
         remove_pidfile(pid_file);
+    /* Clean up strdup() call for bind() address */
+    if (settings.inter)
+      free(settings.inter);
+    if (l_socket)
+      free(l_socket);
+    if (u_socket)
+      free(u_socket);
+
     return 0;
 }
 
 #ifdef USE_REPLICATION
-static int replication_master_init()
+static int replication_start()
 {
-    int s = server_socket(settings.rep_port, 0);
+    static int start = 0;
+    if(start)
+        return(0);
+    if (settings.socketpath != NULL) {
+        if (server_socket_unix(settings.socketpath,settings.access)) {
+            fprintf(stderr, "failed to listen\n");
+            return(-1);
+        }
+    }
+    if (settings.socketpath == NULL) {
+        int udp_port;
+        if (server_socket(settings.port, 0)) {
+            fprintf(stderr, "failed to listen\n");
+            return(-1);
+        }
+        udp_port = settings.udpport ? settings.udpport : settings.port;
+        if (server_socket(udp_port, 1)) {
+            fprintf(stderr, "failed to listen on UDP port %d\n", settings.udpport);
+            return(-1);
+        }
+    }
+    start = 1;
+    return(0);
+}
 
+static int replication_server_init()
+{
     rep_recv = NULL;
     rep_send = NULL;
     rep_conn = NULL;
-    settings.rep_mode = REP_MASTER;
-
-    if (s == -1) {
-        fprintf(stderr, "replication: failed to initialize replication master socket");
-    }else{
-        if(!conn_new(s, conn_repconnect, EV_READ | EV_PERSIST, 1, false, main_base)){
-            fprintf(stderr, "replication: failed to create replication master conn");
-        }else{
-            if (settings.verbose > 0)
-                fprintf(stderr, "replication: master start\n");
-         }
+    if(server_socket_replication(settings.rep_port)){
+        fprintf(stderr, "replication: failed to initialize replication server socket\n");
+        return(-1);
     }
-    return(s);
+    if (settings.verbose > 0)
+        fprintf(stderr, "replication: listen\n");
+    return(replication_start());
 }
 
-static int replication_backup_init()
+static int replication_client_init()
 {
-    struct sockaddr_in master;
-    int s = new_socket(0);
+    int s;
+    conn *c;
+    struct addrinfo    ai;
+    struct sockaddr_in server;
 
     rep_recv  = NULL;
     rep_send  = NULL;
     rep_conn  = NULL;
-    settings.rep_mode = REP_BACKUP;
+
+    memset(&ai,0,sizeof(ai));
+    ai.ai_family   = AF_INET;
+    ai.ai_socktype = SOCK_STREAM;
+    s = new_socket(&ai);
 
     if(s == -1) {
-        fprintf(stderr, "replication: failed to replication backup socket\n");
+        fprintf(stderr, "replication: failed to replication client socket\n");
+        return(-1);
     }else{
         /* connect */
-        memset((char *)&master, 0, sizeof(master));
-        master.sin_family = AF_INET;
-        master.sin_addr   = settings.rep_addr;
-        master.sin_port   = htons(settings.rep_port);
-        if(connect(s,(struct sockaddr *)&master, sizeof(master)) == 0){
-            fprintf(stdout,"replication: connection succeed?!\n");
-            close(s);
-            s = -1;
+        memset((char *)&server, 0, sizeof(server));
+        server.sin_family = AF_INET;
+        server.sin_addr   = settings.rep_addr;
+        server.sin_port   = htons(settings.rep_port);
+        if (settings.verbose > 0)
+            fprintf(stderr,"replication: connect (peer=%s:%d)\n", inet_ntoa(settings.rep_addr), settings.rep_port);
+        if(connect(s,(struct sockaddr *)&server, sizeof(server)) == 0){
+            c = conn_new(s, conn_repconnect, EV_WRITE | EV_PERSIST, DATA_BUFFER_SIZE, false, main_base);
+            if(c == NULL){
+                fprintf(stderr, "replication: failed to create client conn");
+                close(s);
+                return(-1);
+            }
+            drive_machine(c);
         }else{
             if(errno == EINPROGRESS){
-                if (settings.verbose > 0)
-                    fprintf(stdout,"replication: backup start (master=%s:%d)\n", inet_ntoa(settings.rep_addr), settings.rep_port);
-                if(!conn_new(s, conn_repconnect, EV_WRITE | EV_PERSIST, DATA_BUFFER_SIZE, false, main_base)){
-                    fprintf(stderr, "replication: failed to create backup conn");
+                c = conn_new(s, conn_repconnect, EV_WRITE | EV_PERSIST, DATA_BUFFER_SIZE, false, main_base);
+                if(c == NULL){
+                    fprintf(stderr, "replication: failed to create client conn");
                     close(s);
-                    s = -1;
+                    return(-1);
                 }
             }else{
-                fprintf(stdout,"replication: can't connect %s:%d\n", inet_ntoa(master.sin_addr), ntohs(master.sin_port));
+                fprintf(stdout,"replication: can't connect %s:%d\n", inet_ntoa(server.sin_addr), ntohs(server.sin_port));
                 close(s);
-                s = -1;
+                return(-1);
             }
         }
     }
-    return(s);
+    return(0);
 }
 
 static int replication_init()
 {
-    if(settings.rep_addr.s_addr == htonl(INADDR_ANY)){
-        return(replication_master_init());
-    }else{
-        return(replication_backup_init());
+    if(settings.rep_addr.s_addr != htonl(INADDR_ANY)){
+        if(replication_client_init() != -1){
+            return(0);
+        }
     }
+    return(replication_server_init());
 }
 
 static int replication_connect()
@@ -3238,6 +3562,7 @@ static int replication_connect()
     int p[2];
 
     if(pipe(p) == -1){
+        fprintf(stderr, "replication: can't create pipe\n");
         return(-1);
     }else{
         if((f = fcntl(p[0], F_GETFL, 0)) < 0 || fcntl(p[0], F_SETFL, f | O_NONBLOCK) < 0) {
@@ -3251,7 +3576,6 @@ static int replication_connect()
         rep_recv = conn_new(p[0], conn_pipe_recv, EV_READ | EV_PERSIST, DATA_BUFFER_SIZE, false, main_base);
         rep_send = conn_new(p[1], conn_pipe_send, EV_READ | EV_PERSIST, DATA_BUFFER_SIZE, false, main_base);
         event_del(&rep_send->event);
-        replication_marugoto(0);
     }
     return(0);
 }
@@ -3262,7 +3586,7 @@ static int replication_close()
     int     r;
     Q_ITEM *q;
 
-    if (settings.verbose > 1)
+    if(settings.verbose > 0)
         fprintf(stderr,"replication: close\n");
     if(rep_recv){
         rep_recv->rbytes = sizeof(q);
@@ -3302,11 +3626,14 @@ static int replication_close()
         if (settings.verbose > 1)
             fprintf(stderr,"replication: close conn\n");
     }
+    if(!rep_exit)
+        replication_server_init();
     return(0);
 }
 
 static int replication_marugoto(int f)
 {
+    static int   keysend  = 0;
     static int   keycount = 0;
     static char *keylist  = NULL;
     static char *keyptr   = NULL;
@@ -3317,90 +3644,42 @@ static int replication_marugoto(int f)
             keylist  = NULL;
             keyptr   = NULL;
             keycount = 0;
+            keysend  = 0;
         }
-        keylist = assoc_key_snap(&keycount);
-        if(keyptr = keylist){
-            if (settings.verbose > 0)
-                fprintf(stderr,"replication: marugoto start %d\n", keycount);
+        keylist = (char *)assoc_key_snap((int *)&keycount);
+        keyptr  = keylist;
+        if (!keyptr){
+            replication_call_marugoto_end();
+        }else{
+        if (settings.verbose > 0)
+            fprintf(stderr,"replication: marugoto start\n");
         }
     }else{
         if(keyptr){
-            if(*keyptr){
-                replication_call_set(keyptr, strlen(keyptr));
-                keyptr += strlen(keyptr) + 1;
-                keycount--;
-            }else{
-                free(keylist);
-                keylist  = NULL;
-                keyptr   = NULL;
-                keycount = 0;
-                if (settings.verbose > 0)
-                    fprintf(stderr,"replication: marugoto owari\n");
-            }
-        }
-    }
-    return(0);
-}
-
-static int replication_recv(conn *c)
-{
-    int i;
-    int l;
-    int r;
-    char *e;
-    char s[64];
-
-    if(c->rsize - c->rbytes == 0){
-        fprintf(stderr, "replication: recv overfllow\n");
-        replication_close();
-        return(-1);
-    }else{
-        r = read(c->sfd, c->rcurr, c->rsize - c->rbytes);
-        if(r == -1){
-            if(errno == EAGAIN || errno == EINTR){
-                fprintf(stderr,"replication: recv AEGAIN or EINTR\n");
-            }else{
-                fprintf(stderr,"replication: recv error\n");
-                replication_close();
-                return(-1);
-            }
-        }else{
-            if(r == 0){
-                replication_close();
-                return(-1);
-            }else{
-                c->rbytes += r;
-                c->rcurr  += r;
-                while(e = memchr(c->rbuf,'\n',c->rbytes)){
-                    e++;
-                    l = (e - c->rbuf);
-                    if(l >= sizeof(s)){
-                        fprintf(stderr, "replication: result string too long\n");
-                        replication_close();
+            while(*keyptr){
+                item *it = item_get(keyptr, strlen(keyptr));
+                if(it){
+                    item_remove(it);
+                    if(replication_call_rep(keyptr, strlen(keyptr)) == -1){
                         return(-1);
                     }else{
-                        memcpy(s, c->rbuf, l);
-                        s[l] = 0;
-                        for(i=0;rep_rs[i];i++){
-                            if(!strcmp(rep_rs[i], s)){
-                                break;
-                            }
-                        }
-                        if(!rep_rs[i]){
-                            fprintf(stderr, "replication: result error -> %s", s);
-                            replication_close();
-                            return(-1);
-                        }
-                    }
-                    c->rcurr  -= l;
-                    c->rbytes -= l;
-                    if(c->rbytes){
-                        memmove(c->rbuf, e, c->rbytes);
-                    }else{
-                        break;
+                        keysend++;
+                        keyptr += strlen(keyptr) + 1;
+                        return(0);
                     }
                 }
+                keyptr += strlen(keyptr) + 1;
             }
+            if(settings.verbose > 0)
+                fprintf(stderr,"replication: marugoto %d\n", keysend);
+            replication_call_marugoto_end();
+            if(settings.verbose > 0)
+                fprintf(stderr,"replication: marugoto owari\n");
+            free(keylist);
+            keylist  = NULL;
+            keyptr   = NULL;
+            keycount = 0;
+            keysend  = 0;
         }
     }
     return(0);
@@ -3408,21 +3687,10 @@ static int replication_recv(conn *c)
 
 static int replication_send(conn *c)
 {
-    int l;
-    int w;
-
     while(c->wbytes){
-        l = rep_send->wcurr - rep_send->wbuf;
-        w = write(c->sfd, c->wcurr, c->wbytes);
+        int w = write(c->sfd, c->wcurr, c->wbytes);
         if(w == -1){
             if(errno == EAGAIN || errno == EINTR){
-                fprintf(stderr,"replication: send AEGAIN or EINTR\n");
-                if(l){
-                    rep_send->wbytes -= l;
-                    memmove(rep_send->wbuf, rep_send->wcurr, rep_send->wbytes);
-                    rep_send->wcurr = rep_send->wbuf;
-                }
-                break;
             }else{
                 fprintf(stderr,"replication: send error\n");
                 replication_close();
@@ -3440,7 +3708,11 @@ static int replication_pop()
 {
     int      r;
     int      c;
+    int      m;
     Q_ITEM **q;
+
+    if(!rep_conn || !rep_recv || !rep_send)
+        return(0);
 
     r = read(rep_recv->sfd, rep_recv->rbuf, rep_recv->rsize);
     if(r == -1){
@@ -3451,6 +3723,7 @@ static int replication_pop()
         }
     }else{
         c = r / sizeof(Q_ITEM *);
+        m = r % sizeof(Q_ITEM *);
         q = (Q_ITEM **)(rep_recv->rbuf);
         while(c--){
             if(q[c]){
@@ -3478,7 +3751,7 @@ static int replication_pop()
         }else{
             /* finish */
             replication_close();
-            fprintf(stderr,"replication: cleanup complate\n");
+            fprintf(stderr,"replication: cleanup complete\n");
             exit(EXIT_SUCCESS);
         }
     }
@@ -3496,11 +3769,16 @@ static int replication_push()
         w = write(rep_send->sfd, rep_send->wcurr, rep_send->wbytes);
         if(w == -1){
             if(errno == EAGAIN || errno == EINTR){
+                fprintf(stderr,"replication: push EAGAIN or EINTR\n");
                 if(l){
                     rep_send->wbytes -= l;
                     memmove(rep_send->wbuf, rep_send->wcurr, rep_send->wbytes);
+                    rep_send->wcurr = rep_send->wbuf;
                 }
-                break;
+                if(replication_pop() == -1){
+                    fprintf(stderr,"replication: push poperror\n");
+                    return(-1);
+                }
             }else{
                 return(-1);
             }
@@ -3546,12 +3824,22 @@ int replication(enum CMD_TYPE type, R_CMD *cmd)
     Q_ITEM *q;
 
     if(rep_send && rep_conn){
-        if(q = qi_new(type, cmd)) {
+        if(q = qi_new(type, cmd, false)) {
             replication_item(q);
         }else{
-            fprintf(stderr,"replication: can't create Q_ITEM\n");
-            replication_close();
-            return(-1);
+            if(replication_pop() == -1){
+                fprintf(stderr,"replication: queue limit!\n");
+                replication_close();
+                return(-1);
+            }else{
+                if(q = qi_new(type, cmd, true)) {
+                    replication_item(q);
+                }else{
+                    fprintf(stderr,"replication: can't create Q_ITEM\n");
+                    replication_close();
+                    return(-1);
+                }
+            }
         }
     }
     return(0);
