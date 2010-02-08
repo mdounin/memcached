@@ -16,7 +16,7 @@ print $sock_m "set $key 0 0 $vallen\r\n$val\r\n";
 is(scalar <$sock_m>, "STORED\r\n", "stored");
 sync_get_is($sock_m, $sock_b, $key, $val);
 
-my $exptime = 1;
+my $exptime = 3;
 my $val2    = 'replaceval'.$$;
 my $vallen2 = length $val2;
 

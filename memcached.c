@@ -499,7 +499,6 @@ static void conn_close(conn *c) {
 
 #ifdef USE_REPLICATION
     if((settings.rep_mode == REP_BACKUP) && (c == rep_conn)){
-        fprintf(stderr,"replication: close\n");
         replication_master_init();
     }
 #endif /* USE_REPLICATION */
@@ -3263,7 +3262,8 @@ static int replication_close()
     int     r;
     Q_ITEM *q;
 
-    fprintf(stderr,"replication: close\n");
+    if (settings.verbose > 1)
+        fprintf(stderr,"replication: close\n");
     if(rep_recv){
         rep_recv->rbytes = sizeof(q);
         rep_recv->rcurr  = rep_recv->rbuf;

@@ -18,7 +18,7 @@ is(scalar <$sock_m>, "OK\r\n", "did flush_all");
 sync_get_is($sock_m, $sock_b, "foo", undef);
 
 # and the other form, specifying a flush_all time...
-my $expire = 2;
+my $expire = 3;
 print $sock_m "flush_all $expire\r\n";
 is(scalar <$sock_m>, "OK\r\n", "did flush_all in future");
 

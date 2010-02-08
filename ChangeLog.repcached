@@ -1,3 +1,18 @@
+2008-03-10  YASUI Masanobu
+
+	* release of repcached-1.2 for memcached-1.2.4
+
+	* bug fix.
+
+	* flags was not possible to replication.
+          always stored to zero in backup.
+            master> set key flags expire len
+            backup> set key 0     expire len
+          This bug was corrected.
+
+	* fixed memory leaks when replicating the flush_all command.
+	  
+
 2008-02-15  HIROSE Masaaki
 
 	* release of repcached-1.1 for memcached-1.2.4

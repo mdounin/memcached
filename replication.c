@@ -55,6 +55,11 @@ Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd)
         return(NULL);
     }
 
+    q->key  = NULL;
+    q->type = type;
+    q->time = time;
+    q->next = NULL;
+
     if (keylen > 0) {
         q->key = malloc(keylen + 1);
         if(NULL == q->key){
@@ -65,10 +70,6 @@ Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd)
             *(q->key + keylen) = 0;
         }
     }
-    q->type = type;
-    q->time = time;
-    q->next = NULL;
-
     return(q);
 }
 
@@ -137,12 +138,16 @@ int replication_call_defer_del(char *key, size_t keylen, rel_time_t time)
 int replication_call_flush_all()
 {
     R_CMD r;
+    r.key    = NULL;
+    r.keylen = 0;
     return(replication(REPLICATION_FLUSH_ALL, &r));
 }
 
 int replication_call_defer_flush_all(const rel_time_t time)
 {
     R_CMD r;
+    r.key    = NULL;
+    r.keylen = 0;
     r.time   = time;
     return(replication(REPLICATION_DEFER_FLUSH_ALL, &r));
 }
@@ -217,7 +222,7 @@ static int replication_defer_del(conn *c, char *k, rel_time_t exp)
     return(0);
 }
 
-static int replication_set(conn *c, item *i)
+static int replication_set(conn *c, item *it)
 {
     int   r = 0;
     int exp = 0;
@@ -225,19 +230,32 @@ static int replication_set(conn *c, item *i)
     char *s = "set ";
     char *n = "\r\n";
     char *p = NULL;
+    char flag[40];
 
-    if(i->exptime)
-        exp = i->exptime + stats.started;
+    if(it->exptime)
+        exp = it->exptime + stats.started;
+    if(p=ITEM_suffix(it)){
+        int i;
+        memcpy(flag, p, it->nsuffix - 2);
+        flag[it->nsuffix - 2] = 0;
+        for(i=0;i<strlen(flag);i++){
+            if(flag[i] > ' ')
+                break;
+        }
+        memmove(flag,&flag[i],strlen(flag)-i);
+        for(p=flag;*p>' ';p++);
+        *p=0;
+    }
     len += strlen(s);
-    len += i->nkey;
+    len += it->nkey;
     len += 1;
-    len += replication_get_num(NULL, 0);
+    len += strlen(flag);
     len += 1;
     len += replication_get_num(NULL, exp);
     len += 1;
-    len += replication_get_num(NULL, i->nbytes - 2);
+    len += replication_get_num(NULL, it->nbytes - 2);
     len += strlen(n);
-    len += i->nbytes;
+    len += it->nbytes;
     len += strlen(n);
     if(c->wsize < c->wbytes + len){
         if(p = malloc(c->wbytes + len)){
@@ -255,18 +273,19 @@ static int replication_set(conn *c, item *i)
     p = c->wbuf + c->wbytes;
     memcpy(p, s, strlen(s));
     p += strlen(s);
-    memcpy(p, ITEM_key(i), i->nkey);
-    p += i->nkey;
+    memcpy(p, ITEM_key(it), it->nkey);
+    p += it->nkey;
     *(p++) = ' ';
-    p += replication_get_num(p, 0);
+    memcpy(p, flag, strlen(flag));
+    p += strlen(flag);
     *(p++) = ' ';
     p += replication_get_num(p, exp);
     *(p++) = ' ';
-    p += replication_get_num(p, i->nbytes - 2);
+    p += replication_get_num(p, it->nbytes - 2);
     memcpy(p, n, strlen(n));
     p += strlen(n);
-    memcpy(p, ITEM_data(i), i->nbytes);
-    p += i->nbytes;
+    memcpy(p, ITEM_data(it), it->nbytes);
+    p += it->nbytes;
     c->wbytes = p - c->wbuf;
     c->wcurr  = c->wbuf;
     return(0);

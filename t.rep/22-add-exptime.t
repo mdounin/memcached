@@ -12,7 +12,7 @@ my($sock_m, $sock_b) = ($m->sock, $b->sock);
 my($key, $val) = ('addtest', 'addval'.$$);
 my $vallen = length $val;
 
-my $exptime = 1;
+my $exptime = 3;
 
 print $sock_m "add $key 0 $exptime $vallen\r\n$val\r\n";
 is(scalar <$sock_m>, "STORED\r\n", "stored");
