@@ -325,10 +325,12 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
     conn *c = conn_from_freelist();
 
     if (NULL == c) {
-        if (!(c = (conn *)malloc(sizeof(conn)))) {
-            fprintf(stderr, "malloc()\n");
+        if (!(c = (conn *)calloc(1, sizeof(conn)))) {
+            fprintf(stderr, "calloc()\n");
             return NULL;
         }
+        MEMCACHED_CONN_CREATE(c);
+
         c->rbuf = c->wbuf = 0;
         c->ilist = 0;
         c->suffixlist = 0;
@@ -353,13 +355,7 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
 
         if (c->rbuf == 0 || c->wbuf == 0 || c->ilist == 0 || c->iov == 0 ||
                 c->msglist == 0 || c->suffixlist == 0) {
-            if (c->rbuf != 0) free(c->rbuf);
-            if (c->wbuf != 0) free(c->wbuf);
-            if (c->ilist !=0) free(c->ilist);
-            if (c->suffixlist != 0) free(c->suffixlist);
-            if (c->iov != 0) free(c->iov);
-            if (c->msglist != 0) free(c->msglist);
-            free(c);
+            conn_free(c);
             fprintf(stderr, "malloc()\n");
             return NULL;
         }
@@ -423,6 +419,8 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags,
     stats.total_conns++;
     STATS_UNLOCK();
 
+    MEMCACHED_CONN_ALLOCATE(c->sfd);
+
     return c;
 }
 
@@ -459,6 +457,7 @@ static void conn_cleanup(conn *c) {
  */
 void conn_free(conn *c) {
     if (c) {
+        MEMCACHED_CONN_DESTROY(c);
         if (c->hdrbuf)
             free(c->hdrbuf);
         if (c->msglist)
@@ -486,6 +485,7 @@ static void conn_close(conn *c) {
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
 
+    MEMCACHED_CONN_RELEASE(c->sfd);
     close(c->sfd);
     accept_new_conns(true);
     conn_cleanup(c);
@@ -574,6 +574,10 @@ static void conn_set_state(conn *c, int state) {
             assoc_move_next_bucket();
         }
         c->state = state;
+
+        if (state == conn_write) {
+            MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->wbuf, c->wbytes);
+        }
     }
 }
 
@@ -624,7 +628,8 @@ bool do_suffix_add_to_freelist(char *s) {
         return false;
     } else {
         /* try to enlarge free connections array */
-        char **new_freesuffix = realloc(freesuffix, freesuffixtotal * 2);
+        char **new_freesuffix = realloc(freesuffix,
+            sizeof(char *) * freesuffixtotal * 2);
         if (new_freesuffix) {
             freesuffixtotal *= 2;
             freesuffix = new_freesuffix;
@@ -793,7 +798,7 @@ static void out_string(conn *c, const char *str) {
     }
 
     memcpy(c->wbuf, str, len);
-    memcpy(c->wbuf + len, "\r\n", 3);
+    memcpy(c->wbuf + len, "\r\n", 2);
     c->wbytes = len + 2;
     c->wcurr = c->wbuf;
 
@@ -822,7 +827,7 @@ static void complete_nread(conn *c) {
         out_string(c, "CLIENT_ERROR bad data chunk");
     } else {
       ret = store_item(it, comm);
-      if (ret == 1)
+      if (ret == 1) {
 #ifdef USE_REPLICATION
       {
           if( c != rep_conn ){
@@ -833,7 +838,30 @@ static void complete_nread(conn *c) {
 #else
           out_string(c, "STORED");
 #endif /* USE_REPLICATION */
-      else if(ret == 2)
+#ifdef HAVE_DTRACE
+          switch (comm) {
+          case NREAD_ADD:
+              MEMCACHED_COMMAND_ADD(c->sfd, ITEM_key(it), it->nbytes);
+              break;
+          case NREAD_REPLACE:
+              MEMCACHED_COMMAND_REPLACE(c->sfd, ITEM_key(it), it->nbytes);
+              break;
+          case NREAD_APPEND:
+              MEMCACHED_COMMAND_APPEND(c->sfd, ITEM_key(it), it->nbytes);
+              break;
+          case NREAD_PREPEND:
+              MEMCACHED_COMMAND_PREPEND(c->sfd, ITEM_key(it), it->nbytes);
+              break;
+          case NREAD_SET:
+              MEMCACHED_COMMAND_SET(c->sfd, ITEM_key(it), it->nbytes);
+              break;
+          case NREAD_CAS:
+              MEMCACHED_COMMAND_CAS(c->sfd, ITEM_key(it), it->nbytes,
+                                    it->cas_id);
+              break;
+          }
+#endif
+      } else if(ret == 2)
           out_string(c, "EXISTS");
       else if(ret == 3)
           out_string(c, "NOT_FOUND");
@@ -906,6 +934,9 @@ int do_store_item(item *it, int comm) {
 
             if (new_it == NULL) {
                 /* SERVER_ERROR out of memory */
+                if (old_it != NULL)
+                    do_item_remove(old_it);
+
                 return 0;
             }
 
@@ -1301,7 +1332,10 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                     if (new_list) {
                         c->isize *= 2;
                         c->ilist = new_list;
-                    } else break;
+                    } else  {
+                        item_remove(it);
+                        break;
+                    }
                 }
 
                 /*
@@ -1314,6 +1348,8 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 
                 if(return_cas == true)
                 {
+                  MEMCACHED_COMMAND_GETS(c->sfd, ITEM_key(it), it->nbytes,
+                                         it->cas_id);
                   /* Goofy mid-flight realloc. */
                   if (i >= c->suffixsize) {
                     char **new_suffix_list = realloc(c->suffixlist,
@@ -1321,7 +1357,10 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                     if (new_suffix_list) {
                       c->suffixsize *= 2;
                       c->suffixlist  = new_suffix_list;
-                    } else break;
+                    } else {
+                        item_remove(it);
+                        break;
+                    }
                   }
 
                   suffix = suffix_from_freelist();
@@ -1332,6 +1371,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                     stats.get_misses += stats_get_misses;
                     STATS_UNLOCK();
                     out_string(c, "SERVER_ERROR out of memory making CAS suffix");
+                    item_remove(it);
                     return;
                   }
                   *(c->suffixlist + i) = suffix;
@@ -1342,15 +1382,19 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       add_iov(c, suffix, strlen(suffix)) != 0 ||
                       add_iov(c, ITEM_data(it), it->nbytes) != 0)
                       {
+                          item_remove(it);
                           break;
                       }
                 }
                 else
                 {
+                  MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nbytes);
+
                   if (add_iov(c, "VALUE ", 6) != 0 ||
                       add_iov(c, ITEM_key(it), it->nkey) != 0 ||
                       add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
                       {
+                          item_remove(it);
                           break;
                       }
                 }
@@ -1367,6 +1411,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 
             } else {
                 stats_get_misses++;
+                if (return_cas) {
+                    MEMCACHED_COMMAND_GETS(c->sfd, key, -1, 0);
+                } else {
+                    MEMCACHED_COMMAND_GET(c->sfd, key, -1);
+                }
             }
 
             key_token++;
@@ -1451,6 +1500,12 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
       req_cas_id = strtoull(tokens[5].value, NULL, 10);
     }
 
+    if(errno == ERANGE || ((flags == 0 || exptime == 0) && errno == EINVAL)
+       || vlen < 0) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
     if (settings.detail_enabled) {
         stats_prefix_record_set(key);
     }
@@ -1478,6 +1533,17 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         /* swallow the data line */
         c->write_and_go = conn_swallow;
         c->sbytes = vlen + 2;
+
+        /* Avoid stale data persisting in cache because we failed alloc.
+         * Unacceptable for SET. Anywhere else too? */
+        if (comm == NREAD_SET) {
+            it = item_get(key, nkey);
+            if (it) {
+                item_unlink(it);
+                item_remove(it);
+            }
+        }
+
         return;
     }
     if(handle_cas)
@@ -1535,7 +1601,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
         return;
     }
 
-    out_string(c, add_delta(it, incr, delta, temp));
+    out_string(c, add_delta(c, it, incr, delta, temp));
 #ifdef USE_REPLICATION
     if( c != rep_conn){
         replication_call_rep(ITEM_key(it), it->nkey);
@@ -1547,6 +1613,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
 /*
  * adds a delta value to a numeric item.
  *
+ * c     connection requesting the operation
  * it    item to adjust
  * incr  true to increment value, false to decrement
  * delta amount to adjust value by
@@ -1554,7 +1621,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
  *
  * returns a response string to send back to the client.
  */
-char *do_add_delta(item *it, const bool incr, const int64_t delta, char *buf) {
+char *do_add_delta(conn *c, item *it, const bool incr, const int64_t delta, char *buf) {
     char *ptr;
     int64_t value;
     int res;
@@ -1568,11 +1635,13 @@ char *do_add_delta(item *it, const bool incr, const int64_t delta, char *buf) {
         return "CLIENT_ERROR cannot increment or decrement non-numeric value";
     }
 
-    if (incr)
+    if (incr) {
         value += delta;
-    else {
+        MEMCACHED_COMMAND_INCR(c->sfd, ITEM_key(it), value);
+    } else {
         if (delta >= value) value = 0;
         else value -= delta;
+        MEMCACHED_COMMAND_DECR(c->sfd, ITEM_key(it), value);
     }
     sprintf(buf, "%llu", value);
     res = strlen(buf);
@@ -1583,7 +1652,7 @@ char *do_add_delta(item *it, const bool incr, const int64_t delta, char *buf) {
             return "SERVER_ERROR out of memory in incr/decr";
         }
         memcpy(ITEM_data(new_it), buf, res);
-        memcpy(ITEM_data(new_it) + res, "\r\n", 3);
+        memcpy(ITEM_data(new_it) + res, "\r\n", 2);
         do_item_replace(it, new_it);
         do_item_remove(new_it);       /* release our reference */
     } else { /* replace in-place */
@@ -1640,6 +1709,7 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
 
     it = item_get(key, nkey);
     if (it) {
+        MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), exptime);
         if (exptime == 0) {
             item_unlink(it);
             item_remove(it);      /* release our reference */
@@ -1711,6 +1781,8 @@ static void process_command(conn *c, char *command) {
     int comm;
 
     assert(c != NULL);
+
+    MEMCACHED_PROCESS_COMMAND_START(c->sfd, c->rcurr, c->rbytes);
 
     if (settings.verbose > 1)
         fprintf(stderr, "<%d %s\n", c->sfd, command);
@@ -3305,6 +3377,17 @@ int main (int argc, char **argv) {
         }
     }
 
+    /* daemonize if requested */
+    /* if we want to ensure our ability to dump core, don't chdir to / */
+    if (daemonize) {
+        int res;
+        res = daemon(maxcore, settings.verbose);
+        if (res == -1) {
+            fprintf(stderr, "failed to daemon() in order to daemonize\n");
+            return 1;
+        }
+    }
+
     /* lock paged memory if needed */
     if (lock_memory) {
 #ifdef HAVE_MLOCKALL
@@ -3333,18 +3416,6 @@ int main (int argc, char **argv) {
             return 1;
         }
     }
-
-    /* daemonize if requested */
-    /* if we want to ensure our ability to dump core, don't chdir to / */
-    if (daemonize) {
-        int res;
-        res = daemon(maxcore, settings.verbose);
-        if (res == -1) {
-            fprintf(stderr, "failed to daemon() in order to daemonize\n");
-            return 1;
-        }
-    }
-
 
     /* initialize main thread libevent instance */
     main_base = event_init();

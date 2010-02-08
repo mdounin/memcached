@@ -1,3 +1,7 @@
+2008-08-26  HIROSE Masaaki
+
+	* release of repcached-2.1 for memcached-1.2.6
+
 2008-04-11  YASUI Masanobu
   * release of repcached-2.0 for memcached-1.2.5
   * multi master replication support
