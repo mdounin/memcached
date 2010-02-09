@@ -6,7 +6,7 @@
 
 2008-08-26  HIROSE Masaaki
 
-	* release of repcached-2.1 for memcached-1.2.6
+  * release of repcached-2.1 for memcached-1.2.6
 
 2008-04-11  YASUI Masanobu
   * release of repcached-2.0 for memcached-1.2.5
@@ -26,25 +26,25 @@
 
 2008-02-15  HIROSE Masaaki
 
-	* release of repcached-1.1 for memcached-1.2.4
+  * release of repcached-1.1 for memcached-1.2.4
 
 2008-02-05  YASUI Masanobu
 
-	* support memcached-1.2.4's new commands (append, prepend, cas)
-	  known problem: repcached-1.1 cannot replicate cas unique id. so
-	  it is possible that cas operation is fail if master/backup
-	  fail-over occur between gets and cas.
+  * support memcached-1.2.4's new commands (append, prepend, cas)
+    known problem: repcached-1.1 cannot replicate cas unique id. so
+    it is possible that cas operation is fail if master/backup
+    fail-over occur between gets and cas.
 
 2008-02-04  HIROSE Masaaki
 
-	* include test suite for replication.
-	  prove -l t.rep
+  * include test suite for replication.
+    prove -l t.rep
 
 2007-11-13  HIROSE Masaaki
 
-	* release of repcached-1.0 for memcached-1.2.2
+  * release of repcached-1.0 for memcached-1.2.2
 
-	* first release.
+  * first release.
 
 
 
