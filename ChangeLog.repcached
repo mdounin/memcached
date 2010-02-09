@@ -1,3 +1,6 @@
+2009-05-26  YASUI Masanobu
+  * release of repcached-2.2 for memcached-1.2.8
+
 2009-01-05  YASUI Masanobu
   * fixed segmentation fault on marugoto copying for 64bit platform
 

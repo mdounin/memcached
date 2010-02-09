@@ -71,10 +71,13 @@ struct stats {
     uint64_t      set_cmds;
     uint64_t      get_hits;
     uint64_t      get_misses;
+    uint64_t      flush_cmds;
     uint64_t      evictions;
     time_t        started;          /* when the process was started */
     uint64_t      bytes_read;
     uint64_t      bytes_written;
+    unsigned int  accepting_conns;  /* whether we are currently accepting */
+    uint64_t      listen_disabled_num;
 };
 
 #define MAX_VERBOSITY_LEVEL 2
@@ -87,7 +90,6 @@ struct settings {
     char *inter;
     int verbose;
     rel_time_t oldest_live; /* ignore existing items older than this */
-    bool managed;          /* if 1, a tracker manages virtual buckets */
     int evict_to_free;
     char *socketpath;   /* path to unix socket if using local socket */
     int access;  /* access mask (a la chmod) for unix domain socket */
@@ -96,6 +98,9 @@ struct settings {
     int num_threads;        /* number of libevent threads to run */
     char prefix_delimiter;  /* character that marks a key prefix (for stats) */
     int detail_enabled;     /* nonzero if we're collecting detailed stats */
+    int reqs_per_event;     /* Maximum number of io to process on each
+                               io-event. */
+    int backlog;
 #ifdef USE_REPLICATION
     struct in_addr rep_addr;    /* replication addr */
     int rep_port;               /* replication port */
@@ -233,15 +238,9 @@ struct conn {
     int    hdrsize;   /* number of headers' worth of space is allocated */
 
     int    binary;    /* are we in binary mode */
-    int    bucket;    /* bucket number for the next command, if running as
-                         a managed instance. -1 (_not_ 0) means invalid. */
-    int    gen;       /* generation requested for the bucket */
     bool   noreply;   /* True if the reply should not be sent. */
     conn   *next;     /* Used for generating a list of conn structures */
 };
-
-/* number of virtual buckets for a managed instance */
-#define MAX_BUCKETS 32768
 
 /* current time of day (updated periodically) */
 extern volatile rel_time_t current_time;
@@ -250,6 +249,7 @@ extern volatile rel_time_t current_time;
  * Functions
  */
 
+void do_accept_new_conns(const bool do_accept);
 conn *do_conn_from_freelist();
 bool do_conn_add_to_freelist(conn *c);
 char *do_suffix_from_freelist();
@@ -295,6 +295,7 @@ void dispatch_conn_new(int sfd, int init_state, int event_flags, int read_buffer
 char *mt_add_delta(conn *c, item *item, const int incr, const int64_t delta,
                    char *buf);
 void mt_assoc_move_next_bucket(void);
+void mt_accept_new_conns(const bool do_accept);
 conn *mt_conn_from_freelist(void);
 bool  mt_conn_add_to_freelist(conn *c);
 char *mt_suffix_from_freelist(void);
@@ -324,6 +325,7 @@ int   mt_store_item(item *item, int comm);
 
 # define add_delta(c,x,y,z,a)        mt_add_delta(c,x,y,z,a)
 # define assoc_move_next_bucket()    mt_assoc_move_next_bucket()
+# define accept_new_conns(x)         mt_accept_new_conns(x)
 # define conn_from_freelist()        mt_conn_from_freelist()
 # define conn_add_to_freelist(x)     mt_conn_add_to_freelist(x)
 # define suffix_from_freelist()      mt_suffix_from_freelist()
@@ -355,6 +357,7 @@ int   mt_store_item(item *item, int comm);
 
 # define add_delta(c,x,y,z,a)          do_add_delta(c,x,y,z,a)
 # define assoc_move_next_bucket()    do_assoc_move_next_bucket()
+# define accept_new_conns(x)         do_accept_new_conns(x)
 # define conn_from_freelist()        do_conn_from_freelist()
 # define conn_add_to_freelist(x)     do_conn_add_to_freelist(x)
 # define suffix_from_freelist()      do_suffix_from_freelist()

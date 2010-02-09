@@ -5,6 +5,7 @@
  *  $Id$
  */
 #include "memcached.h"
+#include <assert.h>
 #include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -218,6 +219,14 @@ static void create_worker(void *(*func)(void *), void *arg) {
     }
 }
 
+/*
+ * Sets whether or not we accept new connections.
+ */
+void mt_accept_new_conns(const bool do_accept) {
+    pthread_mutex_lock(&conn_lock);
+    do_accept_new_conns(do_accept);
+    pthread_mutex_unlock(&conn_lock);
+}
 
 /*
  * Pulls a conn structure from the freelist, if one is available.
@@ -360,7 +369,7 @@ static void thread_libevent_process(int fd, short which, void *arg) {
 }
 
 /* Which thread we assigned a connection to most recently. */
-static int last_thread = -1;
+static int last_thread = 0;
 
 /*
  * Dispatches a new connection to another thread. This is only ever called
@@ -370,9 +379,16 @@ static int last_thread = -1;
 void dispatch_conn_new(int sfd, int init_state, int event_flags,
                        int read_buffer_size, int is_udp) {
     CQ_ITEM *item = cqi_new();
-    int thread = (last_thread + 1) % settings.num_threads;
 
-    last_thread = thread;
+    int tid = last_thread % (settings.num_threads - 1);
+
+    /* Skip the dispatch thread (0) */
+    tid++;
+    assert(tid != 0);
+    assert(tid < settings.num_threads);
+    LIBEVENT_THREAD *thread = threads + tid;
+
+    last_thread = tid;
 
     item->sfd = sfd;
     item->init_state = init_state;
@@ -380,10 +396,10 @@ void dispatch_conn_new(int sfd, int init_state, int event_flags,
     item->read_buffer_size = read_buffer_size;
     item->is_udp = is_udp;
 
-    cq_push(&threads[thread].new_conn_queue, item);
+    cq_push(&thread->new_conn_queue, item);
 
-    MEMCACHED_CONN_DISPATCH(sfd, threads[thread].thread_id);
-    if (write(threads[thread].notify_send_fd, "", 1) != 1) {
+    MEMCACHED_CONN_DISPATCH(sfd, thread->thread_id);
+    if (write(thread->notify_send_fd, "", 1) != 1) {
         perror("Writing to thread notify pipe");
     }
 }
@@ -639,7 +655,7 @@ void thread_init(int nthreads, struct event_base *main_base) {
     pthread_mutex_init(&cqi_freelist_lock, NULL);
     cqi_freelist = NULL;
 
-    threads = malloc(sizeof(LIBEVENT_THREAD) * nthreads);
+    threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
     if (! threads) {
         perror("Can't allocate thread descriptors");
         exit(1);

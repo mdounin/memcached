@@ -52,7 +52,7 @@ suggestions.
 Listen on TCP port <num>, the default is port 11211.
 .TP
 .B \-U <num> 
-Listen on UDP port <num>, the default is 0, off.
+Listen on UDP port <num>, the default is port 11211, 0 is off.
 .TP
 .B \-M
 Disable automatic removal of items from the cache when out of memory.
@@ -60,9 +60,6 @@ Additions will not be possible until adequate space is freed up.
 .TP
 .B \-r
 Raise the core file size limit to the maximum allowable.
-.TP
-.B \-b
-Run a managed instanced (mnemonic: buckets)\n".
 .TP
 .B \-f <factor>
 Use <factor> as the multiplier for computing the sizes of memory chunks that

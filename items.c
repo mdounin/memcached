@@ -17,7 +17,6 @@
 /* Forward Declarations */
 static void item_link_q(item *it);
 static void item_unlink_q(item *it);
-static uint64_t get_cas_id();
 
 /*
  * We only reposition items in the LRU queue if they haven't been repositioned
@@ -29,7 +28,9 @@ static uint64_t get_cas_id();
 #define LARGEST_ID 255
 typedef struct {
     unsigned int evicted;
+    rel_time_t evicted_time;
     unsigned int outofmemory;
+    unsigned int tailrepairs;
 } itemstats_t;
 
 static item *heads[LARGEST_ID];
@@ -125,6 +126,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
             if (search->refcount == 0) {
                 if (search->exptime == 0 || search->exptime > current_time) {
                     itemstats[id].evicted++;
+                    itemstats[id].evicted_time = current_time - search->time;
                     STATS_LOCK();
                     stats.evictions++;
                     STATS_UNLOCK();
@@ -139,7 +141,26 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
         it = slabs_alloc(ntotal, id);
         if (it == 0) {
             itemstats[id].outofmemory++;
-            return NULL;
+            /* Last ditch effort. There is a very rare bug which causes
+             * refcount leaks. We've fixed most of them, but it still happens,
+             * and it may happen in the future.
+             * We can reasonably assume no item can stay locked for more than
+             * three hours, so if we find one in the tail which is that old,
+             * free it anyway.
+             */
+            tries = 50;
+            for (search = tails[id]; tries > 0 && search != NULL; tries--, search=search->prev) {
+                if (search->refcount != 0 && search->time + 10800 < current_time) {
+                    itemstats[id].tailrepairs++;
+                    search->refcount = 0;
+                    do_item_unlink(search);
+                    break;
+                }
+            }
+            it = slabs_alloc(ntotal, id);
+            if (it == 0) {
+                return NULL;
+            }
         }
     }
 
@@ -343,7 +364,7 @@ char *do_item_cachedump(const unsigned int slabs_clsid, const unsigned int limit
 }
 
 char *do_item_stats(int *bytes) {
-    size_t bufleft = (size_t) LARGEST_ID * 160;
+    size_t bufleft = (size_t) LARGEST_ID * 360;
     char *buffer = malloc(bufleft);
     char *bufcurr = buffer;
     rel_time_t now = current_time;
@@ -360,9 +381,14 @@ char *do_item_stats(int *bytes) {
                 "STAT items:%d:number %u\r\n"
                 "STAT items:%d:age %u\r\n"
                 "STAT items:%d:evicted %u\r\n"
-                "STAT items:%d:outofmemory %u\r\n",
-                    i, sizes[i], i, now - tails[i]->time, i,
-                    itemstats[i].evicted, i, itemstats[i].outofmemory);
+                "STAT items:%d:evicted_time %u\r\n"
+                "STAT items:%d:outofmemory %u\r\n"
+                "STAT items:%d:tailrepairs %u\r\n",
+                    i, sizes[i], i, now - tails[i]->time,
+                    i, itemstats[i].evicted,
+                    i, itemstats[i].evicted_time,
+                    i, itemstats[i].outofmemory,
+                    i, itemstats[i].tailrepairs);
             if (linelen + sizeof("END\r\n") < bufleft) {
                 bufcurr += linelen;
                 bufleft -= linelen;
@@ -429,7 +455,18 @@ bool item_delete_lock_over (item *it) {
 /** wrapper around assoc_find which does the lazy expiration/deletion logic */
 item *do_item_get_notedeleted(const char *key, const size_t nkey, bool *delete_locked) {
     item *it = assoc_find(key, nkey);
+    int was_found = 0;
     if (delete_locked) *delete_locked = false;
+
+    if (settings.verbose > 2) {
+        if (it == NULL) {
+            fprintf(stderr, "> NOT FOUND %s", key);
+        } else {
+            fprintf(stderr, "> FOUND KEY %s", ITEM_key(it));
+            was_found++;
+        }
+    }
+
     if (it != NULL && (it->it_flags & ITEM_DELETED)) {
         /* it's flagged as delete-locked.  let's see if that condition
            is past due, and the 5-second delete_timer just hasn't
@@ -439,20 +476,41 @@ item *do_item_get_notedeleted(const char *key, const size_t nkey, bool *delete_l
             it = NULL;
         }
     }
+
+    if (it == NULL && was_found) {
+        fprintf(stderr, " -nuked by delete lock");
+        was_found--;
+    }
+
     if (it != NULL && settings.oldest_live != 0 && settings.oldest_live <= current_time &&
         it->time <= settings.oldest_live) {
         do_item_unlink(it);           /* MTSAFE - cache_lock held */
         it = NULL;
     }
+
+    if (it == NULL && was_found) {
+        fprintf(stderr, " -nuked by flush");
+        was_found--;
+    }
+
     if (it != NULL && it->exptime != 0 && it->exptime <= current_time) {
         do_item_unlink(it);           /* MTSAFE - cache_lock held */
         it = NULL;
+    }
+
+    if (it == NULL && was_found) {
+        fprintf(stderr, " -nuked by expire");
+        was_found--;
     }
 
     if (it != NULL) {
         it->refcount++;
         DEBUG_REFCNT(it, '+');
     }
+
+    if (settings.verbose > 2)
+        fprintf(stderr, "\n");
+
     return it;
 }
 

@@ -1,5 +1,5 @@
 AC_PREREQ(2.52)
-AC_INIT(memcached, 1.2.6, brad@danga.com)
+AC_INIT(memcached, 1.2.8, brad@danga.com)
 AC_CANONICAL_SYSTEM
 AC_CONFIG_SRCDIR(memcached.c)
 AM_INIT_AUTOMAKE(AC_PACKAGE_NAME, AC_PACKAGE_VERSION)
@@ -29,7 +29,7 @@ AC_SUBST(DTRACE_DEBUG_OBJ)
 AC_SUBST(DTRACEFLAGS)
 
 AC_ARG_ENABLE(64bit,
-  [AS_HELP_STRING([--enable-64bit],[build 64bit verison])])
+  [AS_HELP_STRING([--enable-64bit],[build 64bit version])])
 if test "x$enable_64bit" == "xyes"
 then
     org_cflags=$CFLAGS
