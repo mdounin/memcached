@@ -116,12 +116,14 @@ static int  replication_client_init(void);
 static int  replication_start(void);
 static int  replication_connect(void);
 static int  replication_close(void);
+static void replication_dispatch_close(void);
 static int  replication_marugoto(int);
 static int  replication_send(conn *);
 static int  replication_pop(void);
 static int  replication_push(void);
 static int  replication_exit(void);
 static int  replication_item(Q_ITEM *);
+static pthread_mutex_t replication_pipe_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif /* USE_REPLICATION */
 
 /** exported globals **/
@@ -4457,24 +4459,28 @@ static void remove_pidfile(const char *pid_file) {
 }
 
 static void sig_handler(const int sig) {
-#ifdef USE_REPLICATION
-    switch(sig){
-    case SIGTERM:
-    case SIGINT:
-        if(rep_send && rep_conn){
-            if(replication_exit()){
-                exit(EXIT_FAILURE);
-            }
-        }else{
-            exit(EXIT_SUCCESS);
-        }
-        break;
-    }
-#else
     printf("SIGINT handled.\n");
     exit(EXIT_SUCCESS);
-#endif /* USE_REPLICATION */
 }
+
+#ifdef USE_REPLICATION
+static void sig_handler_cb(int fd, short event, void *arg)
+{
+    struct event *signal = arg;
+
+    printf("got signal %d\n", EVENT_SIGNAL(signal));
+
+    if (replication_exit()) {
+        exit(EXIT_FAILURE);
+    }
+
+    pthread_mutex_lock(&replication_pipe_lock);
+    if (!rep_send) {
+        exit(EXIT_SUCCESS);
+    }
+    pthread_mutex_unlock(&replication_pipe_lock);
+}
+#endif /* USE_REPLICATION */
 
 #ifndef HAVE_SIGIGNORE
 static int sigignore(int sig) {
@@ -4610,9 +4616,6 @@ int main (int argc, char **argv) {
 
     /* handle SIGINT */
     signal(SIGINT, sig_handler);
-#ifdef USE_REPLICATION
-    signal(SIGTERM, sig_handler);
-#endif /* USE_REPLICATION */
 
     /* init settings */
     settings_init();
@@ -4958,6 +4961,17 @@ int main (int argc, char **argv) {
     /* initialize main thread libevent instance */
     main_base = event_init();
 
+#ifdef USE_REPLICATION
+    /* register events for SIGINT and SIGTERM to handle them in main thread */
+    struct event signal_int, signal_term;
+    event_set(&signal_int, SIGINT, EV_SIGNAL|EV_PERSIST, sig_handler_cb,
+              &signal_int);
+    event_add(&signal_int, NULL);
+    event_set(&signal_term, SIGTERM, EV_SIGNAL|EV_PERSIST, sig_handler_cb,
+              &signal_term);
+    event_add(&signal_term, NULL);
+#endif
+
     /* initialize other stuff */
     stats_init();
     assoc_init();
@@ -5131,9 +5145,11 @@ static int replication_connect(void)
             fprintf(stderr, "replication: can't setting O_NONBLOCK pipe[0]\n");
             return(-1);
         }
+        pthread_mutex_lock(&replication_pipe_lock);
         rep_recv = conn_new(p[0], conn_pipe_recv, EV_READ | EV_PERSIST, DATA_BUFFER_SIZE, tcp_transport, main_base);
         rep_send = conn_new(p[1], conn_pipe_send, EV_READ | EV_PERSIST, DATA_BUFFER_SIZE, tcp_transport, main_base);
         event_del(&rep_send->event);
+        pthread_mutex_unlock(&replication_pipe_lock);
     }
     return(0);
 }
@@ -5172,12 +5188,14 @@ static int replication_close(void)
             fprintf(stderr, "replication: close recv %d items\n", c);
         }
     }
+    pthread_mutex_lock(&replication_pipe_lock);
     if(rep_send){
         conn_close(rep_send);
         rep_send = NULL;
         if (settings.verbose > 1)
             fprintf(stderr,"replication: close send\n");
     }
+    pthread_mutex_unlock(&replication_pipe_lock);
     if(rep_conn){
         conn_close(rep_conn);
         rep_conn = NULL;
@@ -5187,6 +5205,18 @@ static int replication_close(void)
     if(!rep_exit)
         replication_server_init();
     return(0);
+}
+
+static void replication_dispatch_close(void)
+{
+    if (settings.verbose > 1)
+        fprintf(stderr, "replication: dispatch close\n");
+    pthread_mutex_lock(&replication_pipe_lock);
+    if (rep_send) {
+        conn_close(rep_send);
+        rep_send = NULL;
+    }
+    pthread_mutex_unlock(&replication_pipe_lock);
 }
 
 static int replication_marugoto(int f)
@@ -5204,7 +5234,9 @@ static int replication_marugoto(int f)
             keycount = 0;
             keysend  = 0;
         }
+        pthread_mutex_lock(&cache_lock);
         keylist = (char *)assoc_key_snap((int *)&keycount);
+        pthread_mutex_unlock(&cache_lock);
         keyptr  = keylist;
         if (!keyptr){
             replication_call_marugoto_end();
@@ -5269,7 +5301,10 @@ static int replication_pop(void)
     int      m;
     Q_ITEM **q;
 
-    if(!rep_conn || !rep_recv || !rep_send)
+    if(settings.verbose > 1)
+        fprintf(stderr, "replication: pop\n");
+
+    if(!rep_recv)
         return(0);
 
     r = read(rep_recv->sfd, rep_recv->rbuf, rep_recv->rsize);
@@ -5279,13 +5314,16 @@ static int replication_pop(void)
             fprintf(stderr,"replication: pop error %d\n", errno);
             return(-1);
         }
+    }if(r == 0){
+        /* other end closed, trigger replication_close() */
+        return(-1);
     }else{
         c = r / sizeof(Q_ITEM *);
         m = r % sizeof(Q_ITEM *);
         q = (Q_ITEM **)(rep_recv->rbuf);
         while(c--){
             if(q[c]){
-                if(replication_cmd(rep_conn, q[c])){
+                if(rep_conn && replication_cmd(rep_conn, q[c])){
                     replication_item(q[c]); /* error retry */
                 }else{
                     qi_free(q[c]);
@@ -5320,23 +5358,12 @@ static int replication_pop(void)
 static int replication_push(void)
 {
     int w;
-    int l;
 
     while(rep_send->wbytes){
-        l = rep_send->wcurr - rep_send->wbuf;
         w = write(rep_send->sfd, rep_send->wcurr, rep_send->wbytes);
         if(w == -1){
             if(errno == EAGAIN || errno == EINTR){
                 fprintf(stderr,"replication: push EAGAIN or EINTR\n");
-                if(l){
-                    rep_send->wbytes -= l;
-                    memmove(rep_send->wbuf, rep_send->wcurr, rep_send->wbytes);
-                    rep_send->wcurr = rep_send->wbuf;
-                }
-                if(replication_pop() == -1){
-                    fprintf(stderr,"replication: push poperror\n");
-                    return(-1);
-                }
             }else{
                 return(-1);
             }
@@ -5356,12 +5383,18 @@ static int replication_exit(void)
 
 static int replication_item(Q_ITEM *q)
 {
+    pthread_mutex_lock(&replication_pipe_lock);
+    if (!rep_send) {
+        pthread_mutex_unlock(&replication_pipe_lock);
+        return 0;
+    }
     if(rep_send->wcurr + rep_send->wbytes + sizeof(q) > rep_send->wbuf + rep_send->wsize){
         fprintf(stderr,"replication: buffer over fllow\n");
         if(q){
             qi_free(q);
         }
-        replication_close();
+        pthread_mutex_unlock(&replication_pipe_lock);
+        replication_dispatch_close();
         return(-1);
     }
     memcpy(rep_send->wcurr + rep_send->wbytes, &q, sizeof(q));
@@ -5371,9 +5404,11 @@ static int replication_item(Q_ITEM *q)
         if(q){
             qi_free(q);
         }
-        replication_close();
+        pthread_mutex_unlock(&replication_pipe_lock);
+        replication_dispatch_close();
         return(-1);
     }
+    pthread_mutex_unlock(&replication_pipe_lock);
     return(0);
 }
 
@@ -5381,24 +5416,19 @@ int replication(enum CMD_TYPE type, R_CMD *cmd)
 {
     Q_ITEM *q;
 
-    if(rep_send && rep_conn){
-        if((q = qi_new(type, cmd, false))) {
-            replication_item(q);
-        }else{
-            if(replication_pop() == -1){
-                fprintf(stderr,"replication: queue limit!\n");
-                replication_close();
-                return(-1);
-            }else{
-                if((q = qi_new(type, cmd, true))) {
-                    replication_item(q);
-                }else{
-                    fprintf(stderr,"replication: can't create Q_ITEM\n");
-                    replication_close();
-                    return(-1);
-                }
-            }
-        }
+    pthread_mutex_lock(&replication_pipe_lock);
+    if (!rep_send) {
+        pthread_mutex_unlock(&replication_pipe_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&replication_pipe_lock);
+
+    if((q = qi_new(type, cmd, false))) {
+        replication_item(q);
+    }else{
+        fprintf(stderr,"replication: can't create Q_ITEM\n");
+        replication_dispatch_close();
+        return(-1);
     }
     return(0);
 }

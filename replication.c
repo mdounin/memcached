@@ -14,10 +14,15 @@ int replication_call_defer_del(char *key, size_t keylen, rel_time_t time);
 
 static Q_ITEM *q_freelist  = NULL;
 static int     q_itemcount = 0;
+static pthread_mutex_t replication_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int get_qi_count(void)
 {
-    return(q_itemcount);
+    int c;
+    pthread_mutex_lock(&replication_queue_lock);
+    c = q_itemcount;
+    pthread_mutex_unlock(&replication_queue_lock);
+    return(c);
 }
 
 Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd, bool reuse)
@@ -27,25 +32,33 @@ Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd, bool reuse)
     uint32_t    keylen = 0;
     rel_time_t  time   = 0;
 
+    pthread_mutex_lock(&replication_queue_lock);
     if(q_freelist){
         q = q_freelist;
         q_freelist = q->next;
     }
 
     if(NULL == q){
-        if(reuse)
+        if(reuse) {
+            pthread_mutex_unlock(&replication_queue_lock);
             return(NULL);
-        if(q_itemcount >= settings.rep_qmax)
+        }
+        if(q_itemcount >= settings.rep_qmax) {
+            pthread_mutex_unlock(&replication_queue_lock);
             return(NULL);
+        }
         q = malloc(sizeof(Q_ITEM));
         if (NULL == q){
             fprintf(stderr,"replication: qi_new out of memory\n");
+            pthread_mutex_unlock(&replication_queue_lock);
             return(NULL);
         }
         q_itemcount++;
         if (settings.verbose > 2)
             fprintf(stderr,"replication: alloc c=%d\n", q_itemcount);
     }
+
+    pthread_mutex_unlock(&replication_queue_lock);
 
     switch (type) {
     case REPLICATION_REP:
@@ -95,8 +108,10 @@ void qi_free(Q_ITEM *q)
             free(q->key);
             q->key = NULL;
         }
+        pthread_mutex_lock(&replication_queue_lock);
         q->next = q_freelist;
         q_freelist = q;
+        pthread_mutex_unlock(&replication_queue_lock);
     }
 }
 
@@ -105,12 +120,14 @@ int qi_free_list()
     int     c = 0;
     Q_ITEM *q = NULL;
 
+    pthread_mutex_lock(&replication_queue_lock);
     while((q = q_freelist)){
         q_itemcount--;
         c++;
         q_freelist = q->next;
         free(q);
     }
+    pthread_mutex_unlock(&replication_queue_lock);
     return(c);
 }
 
@@ -359,12 +376,16 @@ static int replication_marugoto_end(conn *c)
 int replication_cmd(conn *c, Q_ITEM *q)
 {
     item *it;
+    int r;
+
     switch (q->type) {
     case REPLICATION_REP:
-        if((it = assoc_find(q->key, strlen(q->key))))
-            return(replication_rep(c, it));
-        else
+        it = item_get(q->key, strlen(q->key));
+        if (!it)
             return(replication_del(c, q->key));
+        r = replication_rep(c, it);
+        item_remove(it);
+        return r;
     case REPLICATION_DEL:
         return(replication_del(c, q->key));
     case REPLICATION_DEFER_DEL:
