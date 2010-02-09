@@ -1,5 +1,4 @@
 /* See items.c */
-void item_init(void);
 uint64_t get_cas_id(void);
 
 /*@null@*/
@@ -15,12 +14,12 @@ int  do_item_replace(item *it, item *new_it);
 
 /*@null@*/
 char *do_item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes);
-char *do_item_stats(int *bytes);
-
+void do_item_stats(ADD_STAT add_stats, void *c);
 /*@null@*/
-char *do_item_stats_sizes(int *bytes);
+void do_item_stats_sizes(ADD_STAT add_stats, void *c);
 void do_item_flush_expired(void);
-item *item_get(const char *key, const size_t nkey);
 
-item *do_item_get_notedeleted(const char *key, const size_t nkey, bool *delete_locked);
+item *do_item_get(const char *key, const size_t nkey);
 item *do_item_get_nocheck(const char *key, const size_t nkey);
+void item_stats_reset(void);
+extern pthread_mutex_t cache_lock;

@@ -1,61 +1,77 @@
-2009-04-10 [Version 1.2.8 released]
+2009-04-10
 
-       * make -b command actually work
+	* *critical bugfix*. In 1.2.7 under multithreaded mode, memcached
+	  would never restart accepting connections after hitting the
+	  maximum connection limit.
 
-	   * *critical bugfix*. In 1.2.7 under multithreaded mode, memcached would
-	     never restart accepting connections after hitting the maximum connection 
-		 limit.
-	
-	   * remove 'stats maps' command, as it is a potential information leak,
-	     usable if versions prior to 1.2.8 ever have buffer overflows
-		 discovered.
+2009-04-02
 
-2009-04-02 [Version 1.2.7 released]
+	* Fix: Rewrote stat buffer handling (Trond)
 
-       * reset new stats with 'stats reset'
+2009-03-31
 
-2009-03-30 [Version 1.2.7-rc1 released]
+	* Feature:  -b option for configuring backlog
 
-	   * Slew of new tests. (misc, mostly Dustin Sallings)
+	* Feature:  stats settings
 
-	   * Minor bug fixes. (misc, mostly Dustin Sallings, some Dormando)
-	     (see git history for full list)
-	
-	   * -b command for setting the tcp listen backlog (Chris Goffinet)
+	* Fix: binary stat alignment bug (bug26)
 
-	   * Workaround for a more major bug that very rarely makes memcached stop
-	     allowing new data to be set. (Dormando)
+	* Fix: buffer overflow in stats (bug27)
 
-	   * Print why a key was expired in -vv mode (Dormando)
+	* Fix: recycle memory more aggressively (bug14)
 
-	   * cmd_flush stat (Dormando)
+	* Fix: incr validation (bug31)
 
-	   * listen_disabled_num stat for determining if you've hit the maxconns
-	     limit (Dormando)
+	* Fix: 64-bit incr/decr delta problem (bug21)
+
+	* Fix: Ascii UDP set (bug36)
+
+	* Fix: stats slabs' used chunks (bug29)
+
+	* Fix: stats reset resetting more (bug22)
+
+	* Misc: More tests, documentation, cleanliness (godliness)
+
+	* Stable merge (stats, debuggability, listen bugs)
+
+2009-03-11
+
+	* Protocol:  Binary complete (Dustin, Trond, Toru, etc...)
+
+	* Performance:  improvements from facebook (Dormando)
+
+	* Performance:  per-thread stats (Trond)
+
+	* Performance:  Hash expansion in its own thread (Trond)
+
+	* Stats:  Lots of new stats (Dustin)
+
+	* Bug fixes (various)
+
+	See the 1.3.2 release notes or revision control for more detail.
 
 2008-09-06
-
        * Display error status on listen failures (Dormando)
 
        * Remove managed instance code. Incomplete/etc. (Dormando)
 
-	   * Handle broken IPV6 stacks better (Brian Aker)
+          * Handle broken IPV6 stacks better (Brian Aker)
 
-	   * Generate warnings on setsockopt() failures (Brian Aker)
+          * Generate warnings on setsockopt() failures (Brian Aker)
 
-	   * Fix some indentation issues (Brian Aker)
+          * Fix some indentation issues (Brian Aker)
 
-	   * UDP/TCP can be disabled by setting their port to zero (Brian Aker)
+          * UDP/TCP can be disabled by setting their port to zero (Brian Aker)
 
-	   * Zero out libevent thread structures before use (Ricky Zhou)
+          * Zero out libevent thread structures before use (Ricky Zhou)
 
-	   * New stat: Last accessed time for last evicted item per slab class.
-	     (Dormando)
+          * New stat: Last accessed time for last evicted item per slab class.
+            (Dormando)
 
-	   * Use a dedicated socket accept thread (Facebook)
+          * Use a dedicated socket accept thread (Facebook)
 
-	   * Add -R option. Limit the number of requests processed by a connection
-	     at once. Prevents starving other threads if bulk loading. (Facebook)
+          * Add -R option. Limit the number of requests processed by a connection
+            at once. Prevents starving other threads if bulk loading. (Facebook)
 
 2008-07-29 [Version 1.2.6 released]
 
@@ -63,20 +79,20 @@
 
        * Add support for newer automake (Facebook)
 
-	   * DTrace support for Solaris/etc (Trond Norbye)
+       * DTrace support for Solaris/etc (Trond Norbye)
 
-	   * LRU tests (Steve Yen)
+       * LRU tests (Steve Yen)
 
-	   * Handle negative length items properly (Dormando)
+       * Handle negative length items properly (Dormando)
 
-	   * Don't leave stale data after failed set attempts (Dormando)
+       * Don't leave stale data after failed set attempts (Dormando)
 
-	   * Fix refcount leaks, which would result in OOM's on all sets
-	     (Dormando)
+       * Fix refcount leaks, which would result in OOM's on all sets
+	       (Dormando)
 
-	   * Fix buffer overruns (Dustin Sallings, Tomash Brechko)
+       * Fix buffer overruns (Dustin Sallings, Tomash Brechko)
 
-	   * Fix memory corruption with CAS (Dustin Sallings)
+       * Fix memory corruption with CAS (Dustin Sallings)
 
 2008-06-11
 

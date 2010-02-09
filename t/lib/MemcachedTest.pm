@@ -12,7 +12,9 @@ use Cwd;
 my $builddir = getcwd;
 
 
-@EXPORT = qw(new_memcached sleep mem_get_is mem_gets mem_gets_is mem_stats free_port support_replication memcached_version version2num);
+@EXPORT = qw(new_memcached sleep mem_get_is mem_gets mem_gets_is mem_stats
+             supports_sasl free_port support_replication memcached_version
+             version2num);
 
 sub sleep {
     my $n = shift;
@@ -64,32 +66,32 @@ sub mem_get_is {
 }
 
 sub mem_gets {
-  # works on single-line values only.  no newlines in value.
-  my ($sock_opts, $key) = @_;
-  my $opts = ref $sock_opts eq "HASH" ? $sock_opts : {};
-  my $sock = ref $sock_opts eq "HASH" ? $opts->{sock} : $sock_opts;
-  my $val;
-  my $expect_flags = $opts->{flags} || 0;
+    # works on single-line values only.  no newlines in value.
+    my ($sock_opts, $key) = @_;
+    my $opts = ref $sock_opts eq "HASH" ? $sock_opts : {};
+    my $sock = ref $sock_opts eq "HASH" ? $opts->{sock} : $sock_opts;
+    my $val;
+    my $expect_flags = $opts->{flags} || 0;
 
-  print $sock "gets $key\r\n";
-  my $response = <$sock>;
-  if ($response =~ /^END/) {
-    return "NOT_FOUND";
-  }
-  else
-  {
-    $response =~ /VALUE (.*) (\d+) (\d+) (\d+)/;
-    my $flags = $2;
-    my $len = $3;
-    my $identifier = $4;
-    read $sock, $val , $len;
-    # get the END
-    $_ = <$sock>;
-    $_ = <$sock>;
+    print $sock "gets $key\r\n";
+    my $response = <$sock>;
+    if ($response =~ /^END/) {
+        return "NOT_FOUND";
+    }
+    else
+    {
+        $response =~ /VALUE (.*) (\d+) (\d+) (\d+)/;
+        my $flags = $2;
+        my $len = $3;
+        my $identifier = $4;
+        read $sock, $val , $len;
+        # get the END
+        $_ = <$sock>;
+        $_ = <$sock>;
 
-    return ($identifier,$val);    
-  }
-  
+        return ($identifier,$val);
+    }
+
 }
 sub mem_gets_is {
     # works on single-line values only.  no newlines in value.
@@ -141,6 +143,12 @@ sub supports_udp {
     return 1;
 }
 
+sub supports_sasl {
+    my $output = `$builddir/memcached-debug -h`;
+    return 1 if $output =~ /sasl/i;
+    return 0;
+}
+
 sub support_replication {
     my $output = `$builddir/memcached-debug -h`;
     return 1 if $output =~ /^-x <ip_addr>/m;
@@ -161,6 +169,19 @@ sub version2num {
 sub new_memcached {
     my ($args, $passed_port) = @_;
     my $port = $passed_port || free_port();
+    my $host = '127.0.0.1';
+
+    if ($ENV{T_MEMD_USE_DAEMON}) {
+        my ($host, $port) = ($ENV{T_MEMD_USE_DAEMON} =~ m/^([^:]+):(\d+)$/);
+        my $conn = IO::Socket::INET->new(PeerAddr => "$host:$port");
+        if ($conn) {
+            return Memcached::Handle->new(conn => $conn,
+                                          host => $host,
+                                          port => $port);
+        }
+        croak("Failed to connect to specified memcached server.") unless $conn;
+    }
+
     my $udpport = free_port("udp");
     $args .= " -p $port";
     if (supports_udp()) {
@@ -169,6 +190,7 @@ sub new_memcached {
     if ($< == 0) {
         $args .= " -u root";
     }
+
     my $childpid = fork();
 
     my $exe = "$builddir/memcached-debug";
@@ -176,35 +198,37 @@ sub new_memcached {
     croak("memcached binary not executable\n") unless -x _;
 
     unless ($childpid) {
-        exec "$exe $args";
+        exec "$builddir/timedrun 600 $exe $args";
         exit; # never gets here.
     }
 
     # unix domain sockets
     if ($args =~ /-s (\S+)/) {
         sleep 1;
-	my $filename = $1;
-	my $conn = IO::Socket::UNIX->new(Peer => $filename) || 
-	    croak("Failed to connect to unix domain socket: $! '$filename'");
+        my $filename = $1;
+        my $conn = IO::Socket::UNIX->new(Peer => $filename) ||
+            croak("Failed to connect to unix domain socket: $! '$filename'");
 
-	return Memcached::Handle->new(pid  => $childpid,
-				      conn => $conn,
-				      domainsocket => $filename,
-				      port => $port);
+        return Memcached::Handle->new(pid  => $childpid,
+                                      conn => $conn,
+                                      domainsocket => $filename,
+                                      host => $host,
+                                      port => $port);
     }
 
     # try to connect / find open port, only if we're not using unix domain
     # sockets
 
     for (1..20) {
-	my $conn = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port");
-	if ($conn) {
-	    return Memcached::Handle->new(pid  => $childpid,
-					  conn => $conn,
-					  udpport => $udpport,
-					  port => $port);
-	}
-	select undef, undef, undef, 0.10;
+        my $conn = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port");
+        if ($conn) {
+            return Memcached::Handle->new(pid  => $childpid,
+                                          conn => $conn,
+                                          udpport => $udpport,
+                                          host => $host,
+                                          port => $port);
+        }
+        select undef, undef, undef, 0.10;
     }
     croak("Failed to startup/connect to memcached server.");
 }
@@ -218,9 +242,15 @@ sub new {
 
 sub DESTROY {
     my $self = shift;
-    kill 9, $self->{pid};
+    kill 2, $self->{pid};
 }
 
+sub stop {
+    my $self = shift;
+    kill 15, $self->{pid};
+}
+
+sub host { $_[0]{host} }
 sub port { $_[0]{port} }
 sub udpport { $_[0]{udpport} }
 
@@ -228,7 +258,7 @@ sub sock {
     my $self = shift;
 
     if ($self->{conn} && ($self->{domainsocket} || getpeername($self->{conn}))) {
-	return $self->{conn};
+        return $self->{conn};
     }
     return $self->new_sock;
 }
@@ -236,9 +266,9 @@ sub sock {
 sub new_sock {
     my $self = shift;
     if ($self->{domainsocket}) {
-	return IO::Socket::UNIX->new(Peer => $self->{domainsocket});
+        return IO::Socket::UNIX->new(Peer => $self->{domainsocket});
     } else {
-	return IO::Socket::INET->new(PeerAddr => "127.0.0.1:$self->{port}");
+        return IO::Socket::INET->new(PeerAddr => "$self->{host}:$self->{port}");
     }
 }
 
@@ -249,7 +279,7 @@ sub new_udp_sock {
                                  Proto    => 'udp',
                                  LocalAddr => '127.0.0.1',
                                  LocalPort => MemcachedTest::free_port('udp'),
-                                 );
+        );
 
 }
 

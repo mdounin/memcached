@@ -1,16 +1,17 @@
 Name:           memcached
-Version:        1.2.8
-Release:        1%{?dist}
+Version:        @VERSION@
+Release:        @RELEASE@%{?dist}
 Summary:        High Performance, Distributed Memory Object Cache
 
 Group:          System Environment/Daemons
 License:        BSD
 URL:            http://www.danga.com/memcached/
-Source0:        http://www.danga.com/memcached/dist/%{name}-%{version}.tar.gz
+Source0:        http://memcached.googlecode.com/files/%{name}-@FULLVERSION@.tar.gz
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 
 BuildRequires:  libevent-devel
 BuildRequires:  perl(Test::More)
+BuildRequires:  /usr/bin/prove
 Requires: initscripts
 Requires(post): /sbin/chkconfig
 Requires(preun): /sbin/chkconfig, /sbin/service
@@ -22,11 +23,11 @@ system, generic in nature, but intended for use in speeding up dynamic
 web applications by alleviating database load.
 
 %prep
-%setup -q
+%setup -q -n %{name}-@FULLVERSION@
 
 
 %build
-%configure --enable-threads
+%configure
 
 make %{?_smp_mflags}
 
@@ -82,7 +83,7 @@ exit 0
 
 %files
 %defattr(-,root,root,-)
-%doc AUTHORS ChangeLog COPYING NEWS README TODO doc/CONTRIBUTORS doc/*.txt
+%doc AUTHORS ChangeLog COPYING NEWS README doc/CONTRIBUTORS doc/*.txt
 %config(noreplace) %{_sysconfdir}/sysconfig/%{name}
 
 %dir %attr(750,nobody,nobody) %{_localstatedir}/run/memcached
@@ -90,9 +91,15 @@ exit 0
 %{_bindir}/memcached
 %{_mandir}/man1/memcached.1*
 %{_initrddir}/memcached
-
+%{_includedir}/memcached
 
 %changelog
+* Mon Nov  2 2009 Dormando <dormando@rydia.net> - 1.4.3-1
+- Fix autogen more.
+
+* Sat Aug 29 2009 Dustin Sallings <dustin@spy.net> - 1.4.1-1
+- Autogenerate the version number from tags.
+
 * Wed Jul  4 2007 Paul Lindner <lindner@inuus.com> - 1.2.2-5
 - Use /var/run/memcached/ directory to hold PID file
 

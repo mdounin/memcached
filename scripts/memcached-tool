@@ -36,52 +36,19 @@ if ($mode eq "display") {
 
 undef $mode if @ARGV;
 
-die 
-"Usage: memcached-tool <host[:port]> [mode]\n
+die
+    "Usage: memcached-tool <host[:port]> [mode]\n
        memcached-tool 10.0.0.5:11211 display    # shows slabs
        memcached-tool 10.0.0.5:11211            # same.  (default is display)
        memcached-tool 10.0.0.5:11211 stats      # shows general stats
-       memcached-tool 10.0.0.5:11211 move 7 9   # takes 1MB slab from class #7
-                                                # to class #9.
-
-You can only move slabs around once memory is totally allocated, and only
-once the target class is full.  (So you can't move from #6 to #9 and #7
-to #9 at the same itme, since you'd have to wait for #9 to fill from
-the first reassigned page)
+       memcached-tool 10.0.0.5:11211 dump       # dumps keys and values
 " unless $host && $mode;
 
 $host .= ":11211" unless $host =~ /:\d+/;
 
 my $sock = IO::Socket::INET->new(PeerAddr => $host,
-				 Proto    => 'tcp');
+                                 Proto    => 'tcp');
 die "Couldn't connect to $host\n" unless $sock;
-
-
-if ($mode eq "move") {
-    my $tries = 0;
-    while (1) {
-	print $sock "slabs reassign $from $to\r\n";
-	my $res = <$sock>;
-	$res =~ s/\s+//;
-	if ($res eq "DONE") {
-	    print "Success.\n";
-	    exit 0;
-	} elsif ($res eq "CANT") {
-	    print "Error: can't move from $from to $to.  Destination not yet full?  See usage docs.\n";
-	    exit;
-	} elsif ($res eq "BUSY") {
-	    if (++$tries == 3) {
-		print "Failed to move after 3 tries.  Try again later.\n";
-		exit;
-	    }
-
-	    print "Page busy, retrying...\n";
-	    sleep 1;
-	}
-    }
-
-    exit;
-}
 
 if ($mode eq 'dump') {
     my %items;
@@ -102,7 +69,7 @@ if ($mode eq 'dump') {
 
     foreach my $bucket (sort(keys(%items))) {
         print STDERR "Dumping bucket $bucket - " . $items{$bucket} . " total items\n";
-        print $sock "stats cachedump $bucket $items{$bucket} 1\r\n";
+        print $sock "stats cachedump $bucket $items{$bucket}\r\n";
         my %keyexp;
         while (<$sock>) {
             last if /^END/;
@@ -114,17 +81,18 @@ if ($mode eq 'dump') {
         }
 
         foreach my $k (keys(%keyexp)) {
-            my $val;
             print $sock "get $k\r\n";
             my $response = <$sock>;
-            $response =~ /VALUE (\S+) (\d+) (\d+)/;
-            my $flags = $2;
-            my $len = $3;
-            read $sock, $val , $len;
-            # get the END
-            $_ = <$sock>;
-            $_ = <$sock>;
-            print "add $k $flags $keyexp{$k} $len\r\n$val\r\n";
+            if ($response =~ /VALUE (\S+) (\d+) (\d+)/) {
+                my $flags = $2;
+                my $len = $3;
+                my $val;
+                read $sock, $val, $len;
+                print "add $k $flags $keyexp{$k} $len\r\n$val\r\n";
+                # get the END
+                $_ = <$sock>;
+                $_ = <$sock>;
+            }
         }
     }
     exit;
@@ -144,8 +112,8 @@ if ($mode eq 'stats') {
     }
     printf ("#%-17s %5s %11s\n", $host, "Field", "Value");
     foreach my $name (sort(keys(%items))) {
-      printf ("%24s %12s\n", $name, $items{$name});
-      
+        printf ("%24s %12s\n", $name, $items{$name});
+
     }
     exit;
 }
@@ -153,14 +121,14 @@ if ($mode eq 'stats') {
 # display mode:
 
 my %items;  # class -> { number, age, chunk_size, chunks_per_page,
-            #            total_pages, total_chunks, used_chunks,
-            #            free_chunks, free_chunks_end }
+#            total_pages, total_chunks, used_chunks,
+#            free_chunks, free_chunks_end }
 
 print $sock "stats items\r\n";
 while (<$sock>) {
     last if /^END/;
     if (/^STAT items:(\d+):(\w+) (\d+)/) {
-	$items{$1}{$2} = $3;
+        $items{$1}{$2} = $3;
     }
 }
 
@@ -168,19 +136,21 @@ print $sock "stats slabs\r\n";
 while (<$sock>) {
     last if /^END/;
     if (/^STAT (\d+):(\w+) (\d+)/) {
-	$items{$1}{$2} = $3;
+        $items{$1}{$2} = $3;
     }
 }
 
-print "  #  Item_Size   Max_age  1MB_pages Count   Full?\n";
+print "  #  Item_Size  Max_age   Pages   Count   Full?  Evicted Evict_Time OOM\n";
 foreach my $n (1..40) {
     my $it = $items{$n};
     next if (0 == $it->{total_pages});
-    my $size = $it->{chunk_size} < 1024 ? "$it->{chunk_size} B " : 
-	sprintf("%.1f kB", $it->{chunk_size} / 1024.0);
+    my $size = $it->{chunk_size} < 1024 ?
+        "$it->{chunk_size}B" :
+        sprintf("%.1fK", $it->{chunk_size} / 1024.0);
     my $full = $it->{free_chunks_end} == 0 ? "yes" : " no";
-    printf "%3d   %8s %7d s %7d %7d %7s\n",
-                        $n, $size, $it->{age}, $it->{total_pages},
-                        $it->{number}, $full;
+    printf("%3d %8s %9ds %7d %7d %7s %8d %8d %4d\n",
+           $n, $size, $it->{age}, $it->{total_pages},
+           $it->{number}, $full, $it->{evicted},
+           $it->{evicted_time}, $it->{outofmemory});
 }
 

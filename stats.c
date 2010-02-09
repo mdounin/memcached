@@ -6,8 +6,6 @@
  *
  * Author:
  *   Steven Grimm <sgrimm@facebook.com>
- *
- * $Id$
  */
 #include "memcached.h"
 #include <stdio.h>
@@ -66,16 +64,24 @@ void stats_prefix_clear() {
  * in the list.
  */
 /*@null@*/
-static PREFIX_STATS *stats_prefix_find(const char *key) {
+static PREFIX_STATS *stats_prefix_find(const char *key, const size_t nkey) {
     PREFIX_STATS *pfs;
     uint32_t hashval;
     size_t length;
+    bool bailout = true;
 
     assert(key != NULL);
 
-    for (length = 0; key[length] != '\0'; length++)
-        if (key[length] == settings.prefix_delimiter)
+    for (length = 0; length < nkey && key[length] != '\0'; length++) {
+        if (key[length] == settings.prefix_delimiter) {
+            bailout = false;
             break;
+        }
+    }
+
+    if (bailout) {
+        return NULL;
+    }
 
     hashval = hash(key, length, 0) % PREFIX_HASH_SIZE;
 
@@ -113,11 +119,11 @@ static PREFIX_STATS *stats_prefix_find(const char *key) {
 /*
  * Records a "get" of a key.
  */
-void stats_prefix_record_get(const char *key, const bool is_hit) {
+void stats_prefix_record_get(const char *key, const size_t nkey, const bool is_hit) {
     PREFIX_STATS *pfs;
 
     STATS_LOCK();
-    pfs = stats_prefix_find(key);
+    pfs = stats_prefix_find(key, nkey);
     if (NULL != pfs) {
         pfs->num_gets++;
         if (is_hit) {
@@ -130,11 +136,11 @@ void stats_prefix_record_get(const char *key, const bool is_hit) {
 /*
  * Records a "delete" of a key.
  */
-void stats_prefix_record_delete(const char *key) {
+void stats_prefix_record_delete(const char *key, const size_t nkey) {
     PREFIX_STATS *pfs;
 
     STATS_LOCK();
-    pfs = stats_prefix_find(key);
+    pfs = stats_prefix_find(key, nkey);
     if (NULL != pfs) {
         pfs->num_deletes++;
     }
@@ -144,11 +150,11 @@ void stats_prefix_record_delete(const char *key) {
 /*
  * Records a "set" of a key.
  */
-void stats_prefix_record_set(const char *key) {
+void stats_prefix_record_set(const char *key, const size_t nkey) {
     PREFIX_STATS *pfs;
 
     STATS_LOCK();
-    pfs = stats_prefix_find(key);
+    pfs = stats_prefix_find(key, nkey);
     if (NULL != pfs) {
         pfs->num_sets++;
     }
@@ -164,7 +170,7 @@ char *stats_prefix_dump(int *length) {
     PREFIX_STATS *pfs;
     char *buf;
     int i, pos;
-    size_t size;
+    size_t size = 0, written = 0, total_written = 0;
 
     /*
      * Figure out how big the buffer needs to be. This is the sum of the
@@ -187,9 +193,12 @@ char *stats_prefix_dump(int *length) {
     pos = 0;
     for (i = 0; i < PREFIX_HASH_SIZE; i++) {
         for (pfs = prefix_stats[i]; NULL != pfs; pfs = pfs->next) {
-            pos += snprintf(buf + pos, size-pos, format,
+            written = snprintf(buf + pos, size-pos, format,
                            pfs->prefix, pfs->num_gets, pfs->num_hits,
                            pfs->num_sets, pfs->num_deletes);
+            pos += written;
+            total_written += written;
+            assert(total_written < size);
         }
     }
 
@@ -321,16 +330,17 @@ static void test_prefix_dump() {
 
     /* Find a key that hashes to the same bucket as "abc" */
     for (keynum = 0; keynum < PREFIX_HASH_SIZE * 100; keynum++) {
-        sprintf(tmp, "%d", keynum);
+        snprintf(tmp, sizeof(tmp), "%d", keynum);
         if (hashval == hash(tmp, strlen(tmp), 0) % PREFIX_HASH_SIZE) {
             break;
         }
     }
     stats_prefix_record_set(tmp);
-    sprintf(tmp, "PREFIX %d get 0 hit 0 set 1 del 0\r\n"
-                 "PREFIX abc get 2 hit 1 set 1 del 1\r\n"
-                 "PREFIX def get 0 hit 0 set 0 del 1\r\n"
-                 "END\r\n", keynum);
+    snprintf(tmp, sizeof(tmp),
+             "PREFIX %d get 0 hit 0 set 1 del 0\r\n"
+             "PREFIX abc get 2 hit 1 set 1 del 1\r\n"
+             "PREFIX def get 0 hit 0 set 0 del 1\r\n"
+             "END\r\n", keynum);
     test_equals_str("stats with two stats in one bucket",
                     tmp, stats_prefix_dump(&length));
     test_equals_int("stats length with two stats in one bucket",

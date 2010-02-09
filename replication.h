@@ -29,8 +29,15 @@ struct replication_cmd_t {
 
 Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd, bool);
 void    qi_free(Q_ITEM *);
-int     qi_free_list();
+int     qi_free_list(void);
 int     replication_cmd(conn *, Q_ITEM *);
-int     get_qi_count();
+int     get_qi_count(void);
+
+int replication_call_rep(char *key, size_t keylen);
+int replication_call_del(char *key, size_t keylen);
+int replication_call_flush_all(void);
+int replication_call_defer_flush_all(const rel_time_t time);
+int replication_call_marugoto_end(void);
+int replication(enum CMD_TYPE type, R_CMD *cmd);
 
 #endif

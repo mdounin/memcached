@@ -3,15 +3,19 @@
  *
  */
 #include "memcached.h"
+#include "replication.h"
+#include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
 
+int replication_call_defer_del(char *key, size_t keylen, rel_time_t time);
+
 static Q_ITEM *q_freelist  = NULL;
 static int     q_itemcount = 0;
 
-int get_qi_count()
+int get_qi_count(void)
 {
     return(q_itemcount);
 }
@@ -101,7 +105,7 @@ int qi_free_list()
     int     c = 0;
     Q_ITEM *q = NULL;
 
-    while(q = q_freelist){
+    while((q = q_freelist)){
         q_itemcount--;
         c++;
         q_freelist = q->next;
@@ -175,7 +179,7 @@ static int replication_alloc(conn *c, int s)
     if(c->wsize < s){
         while(c->wsize < s)
             c->wsize += 4096;
-        if(p = malloc(c->wsize)){
+        if((p = malloc(c->wsize))){
             memcpy(p, c->wbuf, c->wbytes);
             free(c->wbuf);
             c->wbuf = p;
@@ -244,7 +248,6 @@ static int replication_defer_del(conn *c, char *k, rel_time_t exp)
 
 static int replication_rep(conn *c, item *it)
 {
-    int   r = 0;
     int exp = 0;
     int len = 0;
     char *s = "rep ";
@@ -253,9 +256,9 @@ static int replication_rep(conn *c, item *it)
     char flag[40];
 
     if(it->exptime)
-        exp = it->exptime + stats.started;
+        exp = it->exptime + process_started;
     flag[0]=0;
-    if(p=ITEM_suffix(it)){
+    if((p=ITEM_suffix(it))){
         int i;
         memcpy(flag, p, it->nsuffix - 2);
         flag[it->nsuffix - 2] = 0;
@@ -276,7 +279,7 @@ static int replication_rep(conn *c, item *it)
     len += 1;
     len += replication_get_num(NULL, it->nbytes - 2);
     len += 1;
-    len += replication_get_num(NULL, it->cas_id);
+    len += replication_get_num(NULL, ITEM_get_cas(it));
     len += strlen(n);
     len += it->nbytes;
     len += strlen(n);
@@ -297,7 +300,7 @@ static int replication_rep(conn *c, item *it)
     *(p++) = ' ';
     p += replication_get_num(p, it->nbytes - 2);
     *(p++) = ' ';
-    p += replication_get_num(p, it->cas_id);
+    p += replication_get_num(p, ITEM_get_cas(it));
     memcpy(p, n, strlen(n));
     p += strlen(n);
     memcpy(p, ITEM_data(it), it->nbytes);
@@ -358,7 +361,7 @@ int replication_cmd(conn *c, Q_ITEM *q)
     item *it;
     switch (q->type) {
     case REPLICATION_REP:
-        if(it = assoc_find(q->key, strlen(q->key)))
+        if((it = assoc_find(q->key, strlen(q->key))))
             return(replication_rep(c, it));
         else
             return(replication_del(c, q->key));

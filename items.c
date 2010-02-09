@@ -1,5 +1,4 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
-/* $Id$ */
 #include "memcached.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -25,9 +24,10 @@ static void item_unlink_q(item *it);
  */
 #define ITEM_UPDATE_INTERVAL 60
 
-#define LARGEST_ID 255
+#define LARGEST_ID POWER_LARGEST
 typedef struct {
     unsigned int evicted;
+    unsigned int evicted_nonzero;
     rel_time_t evicted_time;
     unsigned int outofmemory;
     unsigned int tailrepairs;
@@ -38,18 +38,15 @@ static item *tails[LARGEST_ID];
 static itemstats_t itemstats[LARGEST_ID];
 static unsigned int sizes[LARGEST_ID];
 
-void item_init(void) {
-    int i;
-    memset(itemstats, 0, sizeof(itemstats_t) * LARGEST_ID);
-    for(i = 0; i < LARGEST_ID; i++) {
-        heads[i] = NULL;
-        tails[i] = NULL;
-        sizes[i] = 0;
-    }
+void item_stats_reset(void) {
+    pthread_mutex_lock(&cache_lock);
+    memset(itemstats, 0, sizeof(itemstats));
+    pthread_mutex_unlock(&cache_lock);
 }
 
+
 /* Get the next CAS id for a new item. */
-uint64_t get_cas_id() {
+uint64_t get_cas_id(void) {
     static uint64_t cas_id = 0;
     return ++cas_id;
 }
@@ -60,8 +57,7 @@ uint64_t get_cas_id() {
                 fprintf(stderr, "item %x refcnt(%c) %d %c%c%c\n", \
                         it, op, it->refcount, \
                         (it->it_flags & ITEM_LINKED) ? 'L' : ' ', \
-                        (it->it_flags & ITEM_SLABBED) ? 'S' : ' ', \
-                        (it->it_flags & ITEM_DELETED) ? 'D' : ' ')
+                        (it->it_flags & ITEM_SLABBED) ? 'S' : ' ')
 #else
 # define DEBUG_REFCNT(it,op) while(0)
 #endif
@@ -88,18 +84,45 @@ static size_t item_make_header(const uint8_t nkey, const int flags, const int nb
 /*@null@*/
 item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_time_t exptime, const int nbytes) {
     uint8_t nsuffix;
-    item *it;
+    item *it = NULL;
     char suffix[40];
     size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
+    if (settings.use_cas) {
+        ntotal += sizeof(uint64_t);
+    }
 
     unsigned int id = slabs_clsid(ntotal);
     if (id == 0)
         return 0;
 
-    it = slabs_alloc(ntotal, id);
-    if (it == 0) {
-        int tries = 50;
-        item *search;
+    /* do a quick check if we have any expired items in the tail.. */
+    int tries = 50;
+    item *search;
+
+    for (search = tails[id];
+         tries > 0 && search != NULL;
+         tries--, search=search->prev) {
+        if (search->refcount == 0 &&
+            (search->exptime != 0 && search->exptime < current_time)) {
+            it = search;
+            /* I don't want to actually free the object, just steal
+             * the item to avoid to grab the slab mutex twice ;-)
+             */
+            it->refcount = 1;
+            do_item_unlink(it);
+            /* Initialize the item block: */
+            it->slabs_clsid = 0;
+            it->refcount = 0;
+            break;
+        }
+    }
+
+    if (it == NULL && (it = slabs_alloc(ntotal, id)) == NULL) {
+        /*
+        ** Could not find an expired item at the tail, and memory allocation
+        ** failed. Try to evict some items!
+        */
+        tries = 50;
 
         /* If requested to not push old items out of cache when memory runs out,
          * we're out of luck at this point...
@@ -127,6 +150,8 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
                 if (search->exptime == 0 || search->exptime > current_time) {
                     itemstats[id].evicted++;
                     itemstats[id].evicted_time = current_time - search->time;
+                    if (search->exptime != 0)
+                        itemstats[id].evicted_nonzero++;
                     STATS_LOCK();
                     stats.evictions++;
                     STATS_UNLOCK();
@@ -150,7 +175,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
              */
             tries = 50;
             for (search = tails[id]; tries > 0 && search != NULL; tries--, search=search->prev) {
-                if (search->refcount != 0 && search->time + 10800 < current_time) {
+                if (search->refcount != 0 && search->time + TAIL_REPAIR_TIME < current_time) {
                     itemstats[id].tailrepairs++;
                     search->refcount = 0;
                     do_item_unlink(search);
@@ -173,10 +198,10 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
     it->next = it->prev = it->h_next = 0;
     it->refcount = 1;     /* the caller will have a reference */
     DEBUG_REFCNT(it, '*');
-    it->it_flags = 0;
+    it->it_flags = settings.use_cas ? ITEM_CAS : 0;
     it->nkey = nkey;
     it->nbytes = nbytes;
-    strcpy(ITEM_key(it), key);
+    memcpy(ITEM_key(it), key, nkey);
     it->exptime = exptime;
     memcpy(ITEM_suffix(it), suffix, (size_t)nsuffix);
     it->nsuffix = nsuffix;
@@ -213,7 +238,7 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
 
 static void item_link_q(item *it) { /* item is the new head */
     item **head, **tail;
-    /* always true, warns: assert(it->slabs_clsid <= LARGEST_ID); */
+    assert(it->slabs_clsid < LARGEST_ID);
     assert((it->it_flags & ITEM_SLABBED) == 0);
 
     head = &heads[it->slabs_clsid];
@@ -231,7 +256,7 @@ static void item_link_q(item *it) { /* item is the new head */
 
 static void item_unlink_q(item *it) {
     item **head, **tail;
-    /* always true, warns: assert(it->slabs_clsid <= LARGEST_ID); */
+    assert(it->slabs_clsid < LARGEST_ID);
     head = &heads[it->slabs_clsid];
     tail = &tails[it->slabs_clsid];
 
@@ -253,7 +278,7 @@ static void item_unlink_q(item *it) {
 }
 
 int do_item_link(item *it) {
-    MEMCACHED_ITEM_LINK(ITEM_key(it), it->nbytes);
+    MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
     assert(it->nbytes < (1024 * 1024));  /* 1MB max size */
     it->it_flags |= ITEM_LINKED;
@@ -269,10 +294,10 @@ int do_item_link(item *it) {
 #ifdef USE_REPLICATION
     /* Allocate a new CAS ID on link. */
     if(!(it->it_flags & ITEM_REPDATA))
-        it->cas_id = get_cas_id();
+        ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
 #else
     /* Allocate a new CAS ID on link. */
-    it->cas_id = get_cas_id();
+    ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
 #endif /* USE_REPLICATION */
 
     item_link_q(it);
@@ -281,7 +306,7 @@ int do_item_link(item *it) {
 }
 
 void do_item_unlink(item *it) {
-    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nbytes);
+    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
     if ((it->it_flags & ITEM_LINKED) != 0) {
         it->it_flags &= ~ITEM_LINKED;
         STATS_LOCK();
@@ -295,20 +320,19 @@ void do_item_unlink(item *it) {
 }
 
 void do_item_remove(item *it) {
-    MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nbytes);
+    MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
     if (it->refcount != 0) {
         it->refcount--;
         DEBUG_REFCNT(it, '-');
     }
-    assert((it->it_flags & ITEM_DELETED) == 0 || it->refcount != 0);
     if (it->refcount == 0 && (it->it_flags & ITEM_LINKED) == 0) {
         item_free(it);
     }
 }
 
 void do_item_update(item *it) {
-    MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nbytes);
+    MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
     if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
         assert((it->it_flags & ITEM_SLABBED) == 0);
 
@@ -321,8 +345,8 @@ void do_item_update(item *it) {
 }
 
 int do_item_replace(item *it, item *new_it) {
-    MEMCACHED_ITEM_REPLACE(ITEM_key(it), it->nbytes,
-                           ITEM_key(new_it), new_it->nbytes);
+    MEMCACHED_ITEM_REPLACE(ITEM_key(it), it->nkey, it->nbytes,
+                           ITEM_key(new_it), new_it->nkey, new_it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
 
     do_item_unlink(it);
@@ -337,9 +361,9 @@ char *do_item_cachedump(const unsigned int slabs_clsid, const unsigned int limit
     item *it;
     unsigned int len;
     unsigned int shown = 0;
+    char key_temp[KEY_MAX_LENGTH + 1];
     char temp[512];
 
-    if (slabs_clsid > LARGEST_ID) return NULL;
     it = heads[slabs_clsid];
 
     buffer = malloc((size_t)memlimit);
@@ -347,10 +371,16 @@ char *do_item_cachedump(const unsigned int slabs_clsid, const unsigned int limit
     bufcurr = 0;
 
     while (it != NULL && (limit == 0 || shown < limit)) {
-        len = snprintf(temp, sizeof(temp), "ITEM %s [%d b; %lu s]\r\n", ITEM_key(it), it->nbytes - 2, it->exptime + stats.started);
+        assert(it->nkey <= KEY_MAX_LENGTH);
+        /* Copy the key since it may not be null-terminated in the struct */
+        strncpy(key_temp, ITEM_key(it), it->nkey);
+        key_temp[it->nkey] = 0x00; /* terminate */
+        len = snprintf(temp, sizeof(temp), "ITEM %s [%d b; %lu s]\r\n",
+                       key_temp, it->nbytes - 2,
+                       (unsigned long)it->exptime + process_started);
         if (bufcurr + len + 6 > memlimit)  /* 6 is END\r\n\0 */
             break;
-        strcpy(buffer + bufcurr, temp);
+        memcpy(buffer + bufcurr, temp, len);
         bufcurr += len;
         shown++;
         it = it->next;
@@ -363,100 +393,76 @@ char *do_item_cachedump(const unsigned int slabs_clsid, const unsigned int limit
     return buffer;
 }
 
-char *do_item_stats(int *bytes) {
-    size_t bufleft = (size_t) LARGEST_ID * 360;
-    char *buffer = malloc(bufleft);
-    char *bufcurr = buffer;
-    rel_time_t now = current_time;
+void do_item_stats(ADD_STAT add_stats, void *c) {
     int i;
-    int linelen;
-
-    if (buffer == NULL) {
-        return NULL;
-    }
-
     for (i = 0; i < LARGEST_ID; i++) {
         if (tails[i] != NULL) {
-            linelen = snprintf(bufcurr, bufleft,
-                "STAT items:%d:number %u\r\n"
-                "STAT items:%d:age %u\r\n"
-                "STAT items:%d:evicted %u\r\n"
-                "STAT items:%d:evicted_time %u\r\n"
-                "STAT items:%d:outofmemory %u\r\n"
-                "STAT items:%d:tailrepairs %u\r\n",
-                    i, sizes[i], i, now - tails[i]->time,
-                    i, itemstats[i].evicted,
-                    i, itemstats[i].evicted_time,
-                    i, itemstats[i].outofmemory,
-                    i, itemstats[i].tailrepairs);
-            if (linelen + sizeof("END\r\n") < bufleft) {
-                bufcurr += linelen;
-                bufleft -= linelen;
-            }
-            else {
-                /* The caller didn't allocate enough buffer space. */
-                break;
-            }
+            const char *fmt = "items:%d:%s";
+            char key_str[STAT_KEY_LEN];
+            char val_str[STAT_VAL_LEN];
+            int klen = 0, vlen = 0;
+
+            APPEND_NUM_FMT_STAT(fmt, i, "number", "%u", sizes[i]);
+            APPEND_NUM_FMT_STAT(fmt, i, "age", "%u", tails[i]->time);
+            APPEND_NUM_FMT_STAT(fmt, i, "evicted",
+                                "%u", itemstats[i].evicted);
+            APPEND_NUM_FMT_STAT(fmt, i, "evicted_nonzero",
+                                "%u", itemstats[i].evicted_nonzero);
+            APPEND_NUM_FMT_STAT(fmt, i, "evicted_time",
+                                "%u", itemstats[i].evicted_time);
+            APPEND_NUM_FMT_STAT(fmt, i, "outofmemory",
+                                "%u", itemstats[i].outofmemory);
+            APPEND_NUM_FMT_STAT(fmt, i, "tailrepairs",
+                                "%u", itemstats[i].tailrepairs);;
         }
     }
-    memcpy(bufcurr, "END\r\n", 6);
-    bufcurr += 5;
 
-    *bytes = bufcurr - buffer;
-    return buffer;
+    /* getting here means both ascii and binary terminators fit */
+    add_stats(NULL, 0, NULL, 0, c);
 }
 
 /** dumps out a list of objects of each size, with granularity of 32 bytes */
 /*@null@*/
-char* do_item_stats_sizes(int *bytes) {
-    const int num_buckets = 32768;   /* max 1MB object, divided into 32 bytes size buckets */
-    unsigned int *histogram = (unsigned int *)malloc((size_t)num_buckets * sizeof(int));
-    char *buf = (char *)malloc(2 * 1024 * 1024); /* 2MB max response size */
-    int i;
+void do_item_stats_sizes(ADD_STAT add_stats, void *c) {
 
-    if (histogram == 0 || buf == 0) {
-        if (histogram) free(histogram);
-        if (buf) free(buf);
-        return NULL;
-    }
+    /* max 1MB object, divided into 32 bytes size buckets */
+    const int num_buckets = 32768;
+    unsigned int *histogram = calloc(num_buckets, sizeof(int));
 
-    /* build the histogram */
-    memset(histogram, 0, (size_t)num_buckets * sizeof(int));
-    for (i = 0; i < LARGEST_ID; i++) {
-        item *iter = heads[i];
-        while (iter) {
-            int ntotal = ITEM_ntotal(iter);
-            int bucket = ntotal / 32;
-            if ((ntotal % 32) != 0) bucket++;
-            if (bucket < num_buckets) histogram[bucket]++;
-            iter = iter->next;
+    if (histogram != NULL) {
+        int i;
+
+        /* build the histogram */
+        for (i = 0; i < LARGEST_ID; i++) {
+            item *iter = heads[i];
+            while (iter) {
+                int ntotal = ITEM_ntotal(iter);
+                int bucket = ntotal / 32;
+                if ((ntotal % 32) != 0) bucket++;
+                if (bucket < num_buckets) histogram[bucket]++;
+                iter = iter->next;
+            }
         }
-    }
 
-    /* write the buffer */
-    *bytes = 0;
-    for (i = 0; i < num_buckets; i++) {
-        if (histogram[i] != 0) {
-            *bytes += sprintf(&buf[*bytes], "%d %u\r\n", i * 32, histogram[i]);
+        /* write the buffer */
+        for (i = 0; i < num_buckets; i++) {
+            if (histogram[i] != 0) {
+                char key[8];
+                int klen = 0;
+                klen = snprintf(key, sizeof(key), "%d", i * 32);
+                assert(klen < sizeof(key));
+                APPEND_STAT(key, "%u", histogram[i]);
+            }
         }
+        free(histogram);
     }
-    *bytes += sprintf(&buf[*bytes], "END\r\n");
-    free(histogram);
-    return buf;
+    add_stats(NULL, 0, NULL, 0, c);
 }
 
-/** returns true if a deleted item's delete-locked-time is over, and it
-    should be removed from the namespace */
-bool item_delete_lock_over (item *it) {
-    assert(it->it_flags & ITEM_DELETED);
-    return (current_time >= it->exptime);
-}
-
-/** wrapper around assoc_find which does the lazy expiration/deletion logic */
-item *do_item_get_notedeleted(const char *key, const size_t nkey, bool *delete_locked) {
+/** wrapper around assoc_find which does the lazy expiration logic */
+item *do_item_get(const char *key, const size_t nkey) {
     item *it = assoc_find(key, nkey);
     int was_found = 0;
-    if (delete_locked) *delete_locked = false;
 
     if (settings.verbose > 2) {
         if (it == NULL) {
@@ -465,21 +471,6 @@ item *do_item_get_notedeleted(const char *key, const size_t nkey, bool *delete_l
             fprintf(stderr, "> FOUND KEY %s", ITEM_key(it));
             was_found++;
         }
-    }
-
-    if (it != NULL && (it->it_flags & ITEM_DELETED)) {
-        /* it's flagged as delete-locked.  let's see if that condition
-           is past due, and the 5-second delete_timer just hasn't
-           gotten to it yet... */
-        if (!item_delete_lock_over(it)) {
-            if (delete_locked) *delete_locked = true;
-            it = NULL;
-        }
-    }
-
-    if (it == NULL && was_found) {
-        fprintf(stderr, " -nuked by delete lock");
-        was_found--;
     }
 
     if (it != NULL && settings.oldest_live != 0 && settings.oldest_live <= current_time &&
@@ -514,11 +505,7 @@ item *do_item_get_notedeleted(const char *key, const size_t nkey, bool *delete_l
     return it;
 }
 
-item *item_get(const char *key, const size_t nkey) {
-    return item_get_notedeleted(key, nkey, 0);
-}
-
-/** returns an item whether or not it's delete-locked or expired. */
+/** returns an item whether or not it's expired. */
 item *do_item_get_nocheck(const char *key, const size_t nkey) {
     item *it = assoc_find(key, nkey);
     if (it) {

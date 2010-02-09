@@ -1,8 +1,6 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
  * Thread management for memcached.
- *
- *  $Id$
  */
 #include "memcached.h"
 #include <assert.h>
@@ -10,17 +8,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <errno.h>
-
-#ifdef HAVE_MALLOC_H
-#include <malloc.h>
-#endif
-
-#ifdef HAVE_STRING_H
 #include <string.h>
-#endif
-
-#ifdef USE_THREADS
-
 #include <pthread.h>
 
 #define ITEMS_PER_ALLOC 64
@@ -28,12 +16,12 @@
 /* An item in the connection queue. */
 typedef struct conn_queue_item CQ_ITEM;
 struct conn_queue_item {
-    int     sfd;
-    int     init_state;
-    int     event_flags;
-    int     read_buffer_size;
-    int     is_udp;
-    CQ_ITEM *next;
+    int               sfd;
+    enum conn_states  init_state;
+    int               event_flags;
+    int               read_buffer_size;
+    enum network_transport     transport;
+    CQ_ITEM          *next;
 };
 
 /* A connection queue. */
@@ -45,17 +33,11 @@ struct conn_queue {
     pthread_cond_t  cond;
 };
 
-/* Lock for connection freelist */
-static pthread_mutex_t conn_lock;
-
-/* Lock for alternative item suffix freelist */
-static pthread_mutex_t suffix_lock;
-
 /* Lock for cache operations (item_*, assoc_*) */
-static pthread_mutex_t cache_lock;
+pthread_mutex_t cache_lock;
 
-/* Lock for slab allocator operations */
-static pthread_mutex_t slabs_lock;
+/* Connection lock around accepting new connections */
+pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Lock for global stats */
 static pthread_mutex_t stats_lock;
@@ -64,23 +46,16 @@ static pthread_mutex_t stats_lock;
 static CQ_ITEM *cqi_freelist;
 static pthread_mutex_t cqi_freelist_lock;
 
+static LIBEVENT_DISPATCHER_THREAD dispatcher_thread;
+
 /*
  * Each libevent instance has a wakeup pipe, which other threads
  * can use to signal that they've put a new connection on its queue.
  */
-typedef struct {
-    pthread_t thread_id;        /* unique ID of this thread */
-    struct event_base *base;    /* libevent handle this thread uses */
-    struct event notify_event;  /* listen event for notify pipe */
-    int notify_receive_fd;      /* receiving end of notify pipe */
-    int notify_send_fd;         /* sending end of notify pipe */
-    CQ  new_conn_queue;         /* queue of new connections to handle */
-} LIBEVENT_THREAD;
-
 static LIBEVENT_THREAD *threads;
 
 /*
- * Number of threads that have finished setting themselves up.
+ * Number of worker threads that have finished setting themselves up.
  */
 static int init_count = 0;
 static pthread_mutex_t init_lock;
@@ -100,29 +75,11 @@ static void cq_init(CQ *cq) {
 }
 
 /*
- * Waits for work on a connection queue.
- */
-static CQ_ITEM *cq_pop(CQ *cq) {
-    CQ_ITEM *item;
-
-    pthread_mutex_lock(&cq->lock);
-    while (NULL == cq->head)
-        pthread_cond_wait(&cq->cond, &cq->lock);
-    item = cq->head;
-    cq->head = item->next;
-    if (NULL == cq->head)
-        cq->tail = NULL;
-    pthread_mutex_unlock(&cq->lock);
-
-    return item;
-}
-
-/*
  * Looks for an item on a connection queue, but doesn't block if there isn't
  * one.
  * Returns the item, or NULL if no item is available
  */
-static CQ_ITEM *cq_peek(CQ *cq) {
+static CQ_ITEM *cq_pop(CQ *cq) {
     CQ_ITEM *item;
 
     pthread_mutex_lock(&cq->lock);
@@ -156,7 +113,7 @@ static void cq_push(CQ *cq, CQ_ITEM *item) {
 /*
  * Returns a fresh connection queue item.
  */
-static CQ_ITEM *cqi_new() {
+static CQ_ITEM *cqi_new(void) {
     CQ_ITEM *item = NULL;
     pthread_mutex_lock(&cqi_freelist_lock);
     if (cqi_freelist) {
@@ -222,83 +179,21 @@ static void create_worker(void *(*func)(void *), void *arg) {
 /*
  * Sets whether or not we accept new connections.
  */
-void mt_accept_new_conns(const bool do_accept) {
+void accept_new_conns(const bool do_accept) {
     pthread_mutex_lock(&conn_lock);
     do_accept_new_conns(do_accept);
     pthread_mutex_unlock(&conn_lock);
 }
-
-/*
- * Pulls a conn structure from the freelist, if one is available.
- */
-conn *mt_conn_from_freelist() {
-    conn *c;
-
-    pthread_mutex_lock(&conn_lock);
-    c = do_conn_from_freelist();
-    pthread_mutex_unlock(&conn_lock);
-
-    return c;
-}
-
-
-/*
- * Adds a conn structure to the freelist.
- *
- * Returns 0 on success, 1 if the structure couldn't be added.
- */
-bool mt_conn_add_to_freelist(conn *c) {
-    bool result;
-
-    pthread_mutex_lock(&conn_lock);
-    result = do_conn_add_to_freelist(c);
-    pthread_mutex_unlock(&conn_lock);
-
-    return result;
-}
-
-/*
- * Pulls a suffix buffer from the freelist, if one is available.
- */
-char *mt_suffix_from_freelist() {
-    char *s;
-
-    pthread_mutex_lock(&suffix_lock);
-    s = do_suffix_from_freelist();
-    pthread_mutex_unlock(&suffix_lock);
-
-    return s;
-}
-
-
-/*
- * Adds a suffix buffer to the freelist.
- *
- * Returns 0 on success, 1 if the buffer couldn't be added.
- */
-bool mt_suffix_add_to_freelist(char *s) {
-    bool result;
-
-    pthread_mutex_lock(&suffix_lock);
-    result = do_suffix_add_to_freelist(s);
-    pthread_mutex_unlock(&suffix_lock);
-
-    return result;
-}
-
-
 /****************************** LIBEVENT THREADS *****************************/
 
 /*
  * Set up a thread's information.
  */
 static void setup_thread(LIBEVENT_THREAD *me) {
+    me->base = event_init();
     if (! me->base) {
-        me->base = event_init();
-        if (! me->base) {
-            fprintf(stderr, "Can't allocate event base\n");
-            exit(1);
-        }
+        fprintf(stderr, "Can't allocate event base\n");
+        exit(1);
     }
 
     /* Listen for notifications from other threads */
@@ -311,7 +206,24 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         exit(1);
     }
 
-    cq_init(&me->new_conn_queue);
+    me->new_conn_queue = malloc(sizeof(struct conn_queue));
+    if (me->new_conn_queue == NULL) {
+        perror("Failed to allocate memory for connection queue");
+        exit(EXIT_FAILURE);
+    }
+    cq_init(me->new_conn_queue);
+
+    if (pthread_mutex_init(&me->stats.mutex, NULL) != 0) {
+        perror("Failed to initialize mutex");
+        exit(EXIT_FAILURE);
+    }
+
+    me->suffix_cache = cache_create("suffix", SUFFIX_SIZE, sizeof(char*),
+                                    NULL, NULL);
+    if (me->suffix_cache == NULL) {
+        fprintf(stderr, "Failed to create suffix cache\n");
+        exit(EXIT_FAILURE);
+    }
 }
 
 
@@ -330,7 +242,8 @@ static void *worker_libevent(void *arg) {
     pthread_cond_signal(&init_cond);
     pthread_mutex_unlock(&init_lock);
 
-    return (void*) event_base_loop(me->base, 0);
+    event_base_loop(me->base, 0);
+    return NULL;
 }
 
 
@@ -347,13 +260,13 @@ static void thread_libevent_process(int fd, short which, void *arg) {
         if (settings.verbose > 0)
             fprintf(stderr, "Can't read from libevent pipe\n");
 
-    item = cq_peek(&me->new_conn_queue);
+    item = cq_pop(me->new_conn_queue);
 
     if (NULL != item) {
         conn *c = conn_new(item->sfd, item->init_state, item->event_flags,
-                           item->read_buffer_size, item->is_udp, me->base);
+                           item->read_buffer_size, item->transport, me->base);
         if (c == NULL) {
-            if (item->is_udp) {
+            if (IS_UDP(item->transport)) {
                 fprintf(stderr, "Can't listen for events on UDP socket\n");
                 exit(1);
             } else {
@@ -363,29 +276,26 @@ static void thread_libevent_process(int fd, short which, void *arg) {
                 }
                 close(item->sfd);
             }
+        } else {
+            c->thread = me;
         }
         cqi_free(item);
     }
 }
 
 /* Which thread we assigned a connection to most recently. */
-static int last_thread = 0;
+static int last_thread = -1;
 
 /*
  * Dispatches a new connection to another thread. This is only ever called
  * from the main thread, either during initialization (for UDP) or because
  * of an incoming connection.
  */
-void dispatch_conn_new(int sfd, int init_state, int event_flags,
-                       int read_buffer_size, int is_udp) {
+void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
+                       int read_buffer_size, enum network_transport transport) {
     CQ_ITEM *item = cqi_new();
+    int tid = (last_thread + 1) % settings.num_threads;
 
-    int tid = last_thread % (settings.num_threads - 1);
-
-    /* Skip the dispatch thread (0) */
-    tid++;
-    assert(tid != 0);
-    assert(tid < settings.num_threads);
     LIBEVENT_THREAD *thread = threads + tid;
 
     last_thread = tid;
@@ -394,9 +304,9 @@ void dispatch_conn_new(int sfd, int init_state, int event_flags,
     item->init_state = init_state;
     item->event_flags = event_flags;
     item->read_buffer_size = read_buffer_size;
-    item->is_udp = is_udp;
+    item->transport = transport;
 
-    cq_push(&thread->new_conn_queue, item);
+    cq_push(thread->new_conn_queue, item);
 
     MEMCACHED_CONN_DISPATCH(sfd, thread->thread_id);
     if (write(thread->notify_send_fd, "", 1) != 1) {
@@ -407,26 +317,16 @@ void dispatch_conn_new(int sfd, int init_state, int event_flags,
 /*
  * Returns true if this is the thread that listens for new TCP connections.
  */
-int mt_is_listen_thread() {
-    return pthread_self() == threads[0].thread_id;
+int is_listen_thread() {
+    return pthread_self() == dispatcher_thread.thread_id;
 }
 
 /********************************* ITEM ACCESS *******************************/
 
 /*
- * Walks through the list of deletes that have been deferred because the items
- * were locked down at the tmie.
- */
-void mt_run_deferred_deletes() {
-    pthread_mutex_lock(&cache_lock);
-    do_run_deferred_deletes();
-    pthread_mutex_unlock(&cache_lock);
-}
-
-/*
  * Allocates a new item.
  */
-item *mt_item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes) {
+item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes) {
     item *it;
     pthread_mutex_lock(&cache_lock);
     it = do_item_alloc(key, nkey, flags, exptime, nbytes);
@@ -435,13 +335,13 @@ item *mt_item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int n
 }
 
 /*
- * Returns an item if it hasn't been marked as expired or deleted,
+ * Returns an item if it hasn't been marked as expired,
  * lazy-expiring as needed.
  */
-item *mt_item_get_notedeleted(const char *key, const size_t nkey, bool *delete_locked) {
+item *item_get(const char *key, const size_t nkey) {
     item *it;
     pthread_mutex_lock(&cache_lock);
-    it = do_item_get_notedeleted(key, nkey, delete_locked);
+    it = do_item_get(key, nkey);
     pthread_mutex_unlock(&cache_lock);
     return it;
 }
@@ -449,7 +349,7 @@ item *mt_item_get_notedeleted(const char *key, const size_t nkey, bool *delete_l
 /*
  * Links an item into the LRU and hashtable.
  */
-int mt_item_link(item *item) {
+int item_link(item *item) {
     int ret;
 
     pthread_mutex_lock(&cache_lock);
@@ -462,7 +362,7 @@ int mt_item_link(item *item) {
  * Decrements the reference count on an item and adds it to the freelist if
  * needed.
  */
-void mt_item_remove(item *item) {
+void item_remove(item *item) {
     pthread_mutex_lock(&cache_lock);
     do_item_remove(item);
     pthread_mutex_unlock(&cache_lock);
@@ -470,20 +370,17 @@ void mt_item_remove(item *item) {
 
 /*
  * Replaces one item with another in the hashtable.
+ * Unprotected by a mutex lock since the core server does not require
+ * it to be thread-safe.
  */
-int mt_item_replace(item *old, item *new) {
-    int ret;
-
-    pthread_mutex_lock(&cache_lock);
-    ret = do_item_replace(old, new);
-    pthread_mutex_unlock(&cache_lock);
-    return ret;
+int item_replace(item *old_it, item *new_it) {
+    return do_item_replace(old_it, new_it);
 }
 
 /*
  * Unlinks an item from the LRU and hashtable.
  */
-void mt_item_unlink(item *item) {
+void item_unlink(item *item) {
     pthread_mutex_lock(&cache_lock);
     do_item_unlink(item);
     pthread_mutex_unlock(&cache_lock);
@@ -492,30 +389,18 @@ void mt_item_unlink(item *item) {
 /*
  * Moves an item to the back of the LRU queue.
  */
-void mt_item_update(item *item) {
+void item_update(item *item) {
     pthread_mutex_lock(&cache_lock);
     do_item_update(item);
     pthread_mutex_unlock(&cache_lock);
 }
 
 /*
- * Adds an item to the deferred-delete list so it can be reaped later.
- */
-char *mt_defer_delete(item *item, time_t exptime) {
-    char *ret;
-
-    pthread_mutex_lock(&cache_lock);
-    ret = do_defer_delete(item, exptime);
-    pthread_mutex_unlock(&cache_lock);
-    return ret;
-}
-
-/*
  * Does arithmetic on a numeric item value.
  */
-char *mt_add_delta(conn *c, item *item, int incr, const int64_t delta,
-                   char *buf) {
-    char *ret;
+enum delta_result_type add_delta(conn *c, item *item, int incr,
+                                 const int64_t delta, char *buf) {
+    enum delta_result_type ret;
 
     pthread_mutex_lock(&cache_lock);
     ret = do_add_delta(c, item, incr, delta, buf);
@@ -526,11 +411,11 @@ char *mt_add_delta(conn *c, item *item, int incr, const int64_t delta,
 /*
  * Stores an item in the cache (high level, obeys set/add/replace semantics)
  */
-int mt_store_item(item *item, int comm) {
-    int ret;
+enum store_item_type store_item(item *item, int comm, conn* c) {
+    enum store_item_type ret;
 
     pthread_mutex_lock(&cache_lock);
-    ret = do_store_item(item, comm);
+    ret = do_store_item(item, comm, c);
     pthread_mutex_unlock(&cache_lock);
     return ret;
 }
@@ -538,7 +423,7 @@ int mt_store_item(item *item, int comm) {
 /*
  * Flushes expired items after a flush_all call
  */
-void mt_item_flush_expired() {
+void item_flush_expired() {
     pthread_mutex_lock(&cache_lock);
     do_item_flush_expired();
     pthread_mutex_unlock(&cache_lock);
@@ -547,7 +432,7 @@ void mt_item_flush_expired() {
 /*
  * Dumps part of the cache
  */
-char *mt_item_cachedump(unsigned int slabs_clsid, unsigned int limit, unsigned int *bytes) {
+char *item_cachedump(unsigned int slabs_clsid, unsigned int limit, unsigned int *bytes) {
     char *ret;
 
     pthread_mutex_lock(&cache_lock);
@@ -559,94 +444,151 @@ char *mt_item_cachedump(unsigned int slabs_clsid, unsigned int limit, unsigned i
 /*
  * Dumps statistics about slab classes
  */
-char *mt_item_stats(int *bytes) {
-    char *ret;
-
+void  item_stats(ADD_STAT add_stats, void *c) {
     pthread_mutex_lock(&cache_lock);
-    ret = do_item_stats(bytes);
+    do_item_stats(add_stats, c);
     pthread_mutex_unlock(&cache_lock);
-    return ret;
 }
 
 /*
  * Dumps a list of objects of each size in 32-byte increments
  */
-char *mt_item_stats_sizes(int *bytes) {
-    char *ret;
-
+void  item_stats_sizes(ADD_STAT add_stats, void *c) {
     pthread_mutex_lock(&cache_lock);
-    ret = do_item_stats_sizes(bytes);
-    pthread_mutex_unlock(&cache_lock);
-    return ret;
-}
-
-/****************************** HASHTABLE MODULE *****************************/
-
-void mt_assoc_move_next_bucket() {
-    pthread_mutex_lock(&cache_lock);
-    do_assoc_move_next_bucket();
+    do_item_stats_sizes(add_stats, c);
     pthread_mutex_unlock(&cache_lock);
 }
-
-/******************************* SLAB ALLOCATOR ******************************/
-
-void *mt_slabs_alloc(size_t size, unsigned int id) {
-    void *ret;
-
-    pthread_mutex_lock(&slabs_lock);
-    ret = do_slabs_alloc(size, id);
-    pthread_mutex_unlock(&slabs_lock);
-    return ret;
-}
-
-void mt_slabs_free(void *ptr, size_t size, unsigned int id) {
-    pthread_mutex_lock(&slabs_lock);
-    do_slabs_free(ptr, size, id);
-    pthread_mutex_unlock(&slabs_lock);
-}
-
-char *mt_slabs_stats(int *buflen) {
-    char *ret;
-
-    pthread_mutex_lock(&slabs_lock);
-    ret = do_slabs_stats(buflen);
-    pthread_mutex_unlock(&slabs_lock);
-    return ret;
-}
-
-#ifdef ALLOW_SLABS_REASSIGN
-int mt_slabs_reassign(unsigned char srcid, unsigned char dstid) {
-    int ret;
-
-    pthread_mutex_lock(&slabs_lock);
-    ret = do_slabs_reassign(srcid, dstid);
-    pthread_mutex_unlock(&slabs_lock);
-    return ret;
-}
-#endif
 
 /******************************* GLOBAL STATS ******************************/
 
-void mt_stats_lock() {
+void STATS_LOCK() {
     pthread_mutex_lock(&stats_lock);
 }
 
-void mt_stats_unlock() {
+void STATS_UNLOCK() {
     pthread_mutex_unlock(&stats_lock);
+}
+
+void threadlocal_stats_reset(void) {
+    int ii, sid;
+    for (ii = 0; ii < settings.num_threads; ++ii) {
+        pthread_mutex_lock(&threads[ii].stats.mutex);
+
+        threads[ii].stats.get_cmds = 0;
+        threads[ii].stats.get_misses = 0;
+        threads[ii].stats.delete_misses = 0;
+        threads[ii].stats.incr_misses = 0;
+        threads[ii].stats.decr_misses = 0;
+        threads[ii].stats.cas_misses = 0;
+        threads[ii].stats.bytes_read = 0;
+        threads[ii].stats.bytes_written = 0;
+        threads[ii].stats.flush_cmds = 0;
+        threads[ii].stats.conn_yields = 0;
+        threads[ii].stats.auth_cmds = 0;
+        threads[ii].stats.auth_errors = 0;
+
+        for(sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
+            threads[ii].stats.slab_stats[sid].set_cmds = 0;
+            threads[ii].stats.slab_stats[sid].get_hits = 0;
+            threads[ii].stats.slab_stats[sid].delete_hits = 0;
+            threads[ii].stats.slab_stats[sid].incr_hits = 0;
+            threads[ii].stats.slab_stats[sid].decr_hits = 0;
+            threads[ii].stats.slab_stats[sid].cas_hits = 0;
+            threads[ii].stats.slab_stats[sid].cas_badval = 0;
+        }
+
+        pthread_mutex_unlock(&threads[ii].stats.mutex);
+    }
+}
+
+void threadlocal_stats_aggregate(struct thread_stats *stats) {
+    int ii, sid;
+    /* The struct contains a mutex, so I should probably not memset it.. */
+    stats->get_cmds = 0;
+    stats->get_misses = 0;
+    stats->delete_misses = 0;
+    stats->incr_misses = 0;
+    stats->decr_misses = 0;
+    stats->cas_misses = 0;
+    stats->bytes_written = 0;
+    stats->bytes_read = 0;
+    stats->flush_cmds = 0;
+    stats->conn_yields = 0;
+    stats->auth_cmds = 0;
+    stats->auth_errors = 0;
+
+    memset(stats->slab_stats, 0,
+           sizeof(struct slab_stats) * MAX_NUMBER_OF_SLAB_CLASSES);
+
+    for (ii = 0; ii < settings.num_threads; ++ii) {
+        pthread_mutex_lock(&threads[ii].stats.mutex);
+
+        stats->get_cmds += threads[ii].stats.get_cmds;
+        stats->get_misses += threads[ii].stats.get_misses;
+        stats->delete_misses += threads[ii].stats.delete_misses;
+        stats->decr_misses += threads[ii].stats.decr_misses;
+        stats->incr_misses += threads[ii].stats.incr_misses;
+        stats->cas_misses += threads[ii].stats.cas_misses;
+        stats->bytes_read += threads[ii].stats.bytes_read;
+        stats->bytes_written += threads[ii].stats.bytes_written;
+        stats->flush_cmds += threads[ii].stats.flush_cmds;
+        stats->conn_yields += threads[ii].stats.conn_yields;
+        stats->auth_cmds += threads[ii].stats.auth_cmds;
+        stats->auth_errors += threads[ii].stats.auth_errors;
+
+        for (sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
+            stats->slab_stats[sid].set_cmds +=
+                threads[ii].stats.slab_stats[sid].set_cmds;
+            stats->slab_stats[sid].get_hits +=
+                threads[ii].stats.slab_stats[sid].get_hits;
+            stats->slab_stats[sid].delete_hits +=
+                threads[ii].stats.slab_stats[sid].delete_hits;
+            stats->slab_stats[sid].decr_hits +=
+                threads[ii].stats.slab_stats[sid].decr_hits;
+            stats->slab_stats[sid].incr_hits +=
+                threads[ii].stats.slab_stats[sid].incr_hits;
+            stats->slab_stats[sid].cas_hits +=
+                threads[ii].stats.slab_stats[sid].cas_hits;
+            stats->slab_stats[sid].cas_badval +=
+                threads[ii].stats.slab_stats[sid].cas_badval;
+        }
+
+        pthread_mutex_unlock(&threads[ii].stats.mutex);
+    }
+}
+
+void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
+    int sid;
+
+    out->set_cmds = 0;
+    out->get_hits = 0;
+    out->delete_hits = 0;
+    out->incr_hits = 0;
+    out->decr_hits = 0;
+    out->cas_hits = 0;
+    out->cas_badval = 0;
+
+    for (sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
+        out->set_cmds += stats->slab_stats[sid].set_cmds;
+        out->get_hits += stats->slab_stats[sid].get_hits;
+        out->delete_hits += stats->slab_stats[sid].delete_hits;
+        out->decr_hits += stats->slab_stats[sid].decr_hits;
+        out->incr_hits += stats->slab_stats[sid].incr_hits;
+        out->cas_hits += stats->slab_stats[sid].cas_hits;
+        out->cas_badval += stats->slab_stats[sid].cas_badval;
+    }
 }
 
 /*
  * Initializes the thread subsystem, creating various worker threads.
  *
- * nthreads  Number of event handler threads to spawn
+ * nthreads  Number of worker event handler threads to spawn
  * main_base Event base for main thread
  */
 void thread_init(int nthreads, struct event_base *main_base) {
     int         i;
 
     pthread_mutex_init(&cache_lock, NULL);
-    pthread_mutex_init(&conn_lock, NULL);
-    pthread_mutex_init(&slabs_lock, NULL);
     pthread_mutex_init(&stats_lock, NULL);
 
     pthread_mutex_init(&init_lock, NULL);
@@ -661,8 +603,8 @@ void thread_init(int nthreads, struct event_base *main_base) {
         exit(1);
     }
 
-    threads[0].base = main_base;
-    threads[0].thread_id = pthread_self();
+    dispatcher_thread.base = main_base;
+    dispatcher_thread.thread_id = pthread_self();
 
     for (i = 0; i < nthreads; i++) {
         int fds[2];
@@ -674,21 +616,19 @@ void thread_init(int nthreads, struct event_base *main_base) {
         threads[i].notify_receive_fd = fds[0];
         threads[i].notify_send_fd = fds[1];
 
-    setup_thread(&threads[i]);
+        setup_thread(&threads[i]);
     }
 
     /* Create threads after we've done all the libevent setup. */
-    for (i = 1; i < nthreads; i++) {
+    for (i = 0; i < nthreads; i++) {
         create_worker(worker_libevent, &threads[i]);
     }
 
     /* Wait for all the threads to set themselves up before returning. */
     pthread_mutex_lock(&init_lock);
-    init_count++; /* main thread */
     while (init_count < nthreads) {
         pthread_cond_wait(&init_cond, &init_lock);
     }
     pthread_mutex_unlock(&init_lock);
 }
 
-#endif

@@ -1,5 +1,9 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
-/* $Id$ */
+
+/** \file
+ * The main memcached header holding commonly used data
+ * structures and function prototypes.
+ */
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -11,13 +15,26 @@
 #include <netinet/in.h>
 #include <event.h>
 #include <netdb.h>
+#include <pthread.h>
+#include <unistd.h>
+
+#include "protocol_binary.h"
+#include "cache.h"
+
+#include "sasl_defs.h"
+
+/** Maximum length of a key. */
+#define KEY_MAX_LENGTH 250
+
+/** Size of an incr buf. */
+#define INCR_MAX_STORAGE_LEN 24
 
 #define DATA_BUFFER_SIZE 2048
 #define UDP_READ_BUFFER_SIZE 65536
 #define UDP_MAX_PAYLOAD_SIZE 1400
 #define UDP_HEADER_SIZE 8
 #define MAX_SENDBUF_SIZE (256 * 1024 * 1024)
-/* I'm told the max legnth of a 64-bit num converted to string is 20 bytes.
+/* I'm told the max length of a 64-bit num converted to string is 20 bytes.
  * Plus a few for spaces, \r\n, \0 */
 #define SUFFIX_SIZE 24
 
@@ -39,28 +56,185 @@
 #define IOV_LIST_HIGHWAT 600
 #define MSG_LIST_HIGHWAT 100
 
-/* Get a consistent bool type */
-#if HAVE_STDBOOL_H
-# include <stdbool.h>
-#else
-  typedef enum {false = 0, true = 1} bool;
-#endif
-
-#if HAVE_STDINT_H
-# include <stdint.h>
-#else
- typedef unsigned char             uint8_t;
-#endif
+/* Binary protocol stuff */
+#define MIN_BIN_PKT_LENGTH 16
+#define BIN_PKT_HDR_WORDS (MIN_BIN_PKT_LENGTH/sizeof(uint32_t))
 
 /* unistd.h is here */
 #if HAVE_UNISTD_H
 # include <unistd.h>
 #endif
 
+/* Slab sizing definitions. */
+#define POWER_SMALLEST 1
+#define POWER_LARGEST  200
+#define CHUNK_ALIGN_BYTES 8
+#define DONT_PREALLOC_SLABS
+#define MAX_NUMBER_OF_SLAB_CLASSES (POWER_LARGEST + 1)
+
+/** How long an object can reasonably be assumed to be locked before
+    harvesting it on a low memory condition. */
+#define TAIL_REPAIR_TIME (3 * 3600)
+
+/* warning: don't use these macros with a function, as it evals its arg twice */
+#define ITEM_get_cas(i) ((uint64_t)(((i)->it_flags & ITEM_CAS) ? \
+                                    *(uint64_t*)&((i)->end[0]) : 0x0))
+#define ITEM_set_cas(i,v) { if ((i)->it_flags & ITEM_CAS) { \
+                          *(uint64_t*)&((i)->end[0]) = v; } }
+
+#define ITEM_key(item) (((char*)&((item)->end[0])) \
+         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_suffix(item) ((char*) &((item)->end[0]) + (item)->nkey + 1 \
+         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_data(item) ((char*) &((item)->end[0]) + (item)->nkey + 1 \
+         + (item)->nsuffix \
+         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 \
+         + (item)->nsuffix + (item)->nbytes \
+         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define STAT_KEY_LEN 128
+#define STAT_VAL_LEN 128
+
+/** Append a simple stat with a stat name, value format and value */
+#define APPEND_STAT(name, fmt, val) \
+    append_stat(name, add_stats, c, fmt, val);
+
+/** Append an indexed stat with a stat name (with format), value format
+    and value */
+#define APPEND_NUM_FMT_STAT(name_fmt, num, name, fmt, val)          \
+    klen = snprintf(key_str, STAT_KEY_LEN, name_fmt, num, name);    \
+    vlen = snprintf(val_str, STAT_VAL_LEN, fmt, val);               \
+    add_stats(key_str, klen, val_str, vlen, c);
+
+/** Common APPEND_NUM_FMT_STAT format. */
+#define APPEND_NUM_STAT(num, name, fmt, val) \
+    APPEND_NUM_FMT_STAT("%d:%s", num, name, fmt, val)
+
+/**
+ * Callback for any function producing stats.
+ *
+ * @param key the stat's key
+ * @param klen length of the key
+ * @param val the stat's value in an ascii form (e.g. text form of a number)
+ * @param vlen length of the value
+ * @parm cookie magic callback cookie
+ */
+typedef void (*ADD_STAT)(const char *key, const uint16_t klen,
+                         const char *val, const uint32_t vlen,
+                         const void *cookie);
+
+/*
+ * NOTE: If you modify this table you _MUST_ update the function state_text
+ */
+/**
+ * Possible states of a connection.
+ */
+enum conn_states {
+    conn_listening,  /**< the socket which listens for connections */
+    conn_new_cmd,    /**< Prepare connection for next command */
+    conn_waiting,    /**< waiting for a readable socket */
+    conn_read,       /**< reading in a command line */
+    conn_parse_cmd,  /**< try to parse a command from the input buffer */
+    conn_write,      /**< writing out a simple response */
+    conn_nread,      /**< reading in a fixed number of bytes */
+    conn_swallow,    /**< swallowing unnecessary bytes w/o storing */
+    conn_closing,    /**< closing this connection */
+    conn_mwrite,     /**< writing out many items sequentially */
+#ifdef USE_REPLICATION
+    conn_repconnect, /**< replication connecting to master */
+    conn_rep_listen, /**< replication listening socket */
+    conn_pipe_recv,  /**< replication command pipe recv */
+    conn_pipe_send,  /**< replication command pipe send */
+#endif /* USE_REPLICATION */
+    conn_max_state,  /**< Max state value (used for assertion) */
+};
+
+enum bin_substates {
+    bin_no_state,
+    bin_reading_set_header,
+    bin_reading_cas_header,
+    bin_read_set_value,
+    bin_reading_get_key,
+    bin_reading_stat,
+    bin_reading_del_header,
+    bin_reading_incr_header,
+    bin_read_flush_exptime,
+    bin_reading_sasl_auth,
+    bin_reading_sasl_auth_data
+};
+
+enum protocol {
+    ascii_prot = 3, /* arbitrary value. */
+    binary_prot,
+    negotiating_prot /* Discovering the protocol */
+};
+
+enum network_transport {
+    local_transport, /* Unix sockets*/
+    tcp_transport,
+    udp_transport
+};
+
+#define IS_UDP(x) (x == udp_transport)
+
+#define NREAD_ADD 1
+#define NREAD_SET 2
+#define NREAD_REPLACE 3
+#define NREAD_APPEND 4
+#define NREAD_PREPEND 5
+#define NREAD_CAS 6
+
+enum store_item_type {
+    NOT_STORED=0, STORED, EXISTS, NOT_FOUND
+};
+
+enum delta_result_type {
+    OK, NON_NUMERIC, EOM
+};
+
 /** Time relative to server start. Smaller than time_t on 64-bit systems. */
 typedef unsigned int rel_time_t;
 
+/** Stats stored per slab (and per thread). */
+struct slab_stats {
+    uint64_t  set_cmds;
+    uint64_t  get_hits;
+    uint64_t  delete_hits;
+    uint64_t  cas_hits;
+    uint64_t  cas_badval;
+    uint64_t  incr_hits;
+    uint64_t  decr_hits;
+};
+
+/**
+ * Stats stored per-thread.
+ */
+struct thread_stats {
+    pthread_mutex_t   mutex;
+    uint64_t          get_cmds;
+    uint64_t          get_misses;
+    uint64_t          delete_misses;
+    uint64_t          incr_misses;
+    uint64_t          decr_misses;
+    uint64_t          cas_misses;
+    uint64_t          bytes_read;
+    uint64_t          bytes_written;
+    uint64_t          flush_cmds;
+    uint64_t          conn_yields; /* # of yields for connections (-R option)*/
+    uint64_t          auth_cmds;
+    uint64_t          auth_errors;
+    struct slab_stats slab_stats[MAX_NUMBER_OF_SLAB_CLASSES];
+};
+
+/**
+ * Global stats.
+ */
 struct stats {
+    pthread_mutex_t mutex;
     unsigned int  curr_items;
     unsigned int  total_items;
     uint64_t      curr_bytes;
@@ -71,17 +245,20 @@ struct stats {
     uint64_t      set_cmds;
     uint64_t      get_hits;
     uint64_t      get_misses;
-    uint64_t      flush_cmds;
     uint64_t      evictions;
+#if 0
     time_t        started;          /* when the process was started */
-    uint64_t      bytes_read;
-    uint64_t      bytes_written;
-    unsigned int  accepting_conns;  /* whether we are currently accepting */
+#endif
+    bool          accepting_conns;  /* whether we are currently accepting */
     uint64_t      listen_disabled_num;
 };
 
 #define MAX_VERBOSITY_LEVEL 2
 
+/* When adding a setting, be sure to update process_stat_settings */
+/**
+ * Globally accessible settings as derived from the commandline.
+ */
 struct settings {
     size_t maxbytes;
     int maxconns;
@@ -95,12 +272,16 @@ struct settings {
     int access;  /* access mask (a la chmod) for unix domain socket */
     double factor;          /* chunk size growth factor */
     int chunk_size;
-    int num_threads;        /* number of libevent threads to run */
+    int num_threads;        /* number of worker (without dispatcher) libevent threads to run */
     char prefix_delimiter;  /* character that marks a key prefix (for stats) */
     int detail_enabled;     /* nonzero if we're collecting detailed stats */
     int reqs_per_event;     /* Maximum number of io to process on each
                                io-event. */
+    bool use_cas;
+    enum protocol binding_protocol;
     int backlog;
+    int item_size_max;        /* Maximum item size, and upper end for slabs */
+    bool sasl;              /* SASL on/off */
 #ifdef USE_REPLICATION
     struct in_addr rep_addr;    /* replication addr */
     int rep_port;               /* replication port */
@@ -109,10 +290,11 @@ struct settings {
 };
 
 extern struct stats stats;
+extern time_t process_started;
 extern struct settings settings;
 
 #define ITEM_LINKED 1
-#define ITEM_DELETED 2
+#define ITEM_CAS 2
 
 /* temp */
 #define ITEM_SLABBED 4
@@ -121,6 +303,9 @@ extern struct settings settings;
 #define ITEM_REPDATA 128
 #endif /*USE_REPLICATION*/
 
+/**
+ * Structure for storing items within memcached.
+ */
 typedef struct _stritem {
     struct _stritem *next;
     struct _stritem *prev;
@@ -133,48 +318,38 @@ typedef struct _stritem {
     uint8_t         it_flags;   /* ITEM_* above */
     uint8_t         slabs_clsid;/* which slab class we're in */
     uint8_t         nkey;       /* key length, w/terminating null and padding */
-    uint64_t        cas_id;     /* the CAS identifier */
     void * end[];
+    /* if it_flags & ITEM_CAS we have 8 bytes CAS */
     /* then null-terminated key */
     /* then " flags length\r\n" (no terminating null) */
     /* then data with terminating \r\n (no terminating null; it's binary!) */
 } item;
 
-#define ITEM_key(item) ((char*)&((item)->end[0]))
+typedef struct {
+    pthread_t thread_id;        /* unique ID of this thread */
+    struct event_base *base;    /* libevent handle this thread uses */
+    struct event notify_event;  /* listen event for notify pipe */
+    int notify_receive_fd;      /* receiving end of notify pipe */
+    int notify_send_fd;         /* sending end of notify pipe */
+    struct thread_stats stats;  /* Stats generated by this thread */
+    struct conn_queue *new_conn_queue; /* queue of new connections to handle */
+    cache_t *suffix_cache;      /* suffix cache */
+} LIBEVENT_THREAD;
 
-/* warning: don't use these macros with a function, as it evals its arg twice */
-#define ITEM_suffix(item) ((char*) &((item)->end[0]) + (item)->nkey + 1)
-#define ITEM_data(item) ((char*) &((item)->end[0]) + (item)->nkey + 1 + (item)->nsuffix)
-#define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 + (item)->nsuffix + (item)->nbytes)
+typedef struct {
+    pthread_t thread_id;        /* unique ID of this thread */
+    struct event_base *base;    /* libevent handle this thread uses */
+} LIBEVENT_DISPATCHER_THREAD;
 
-enum conn_states {
-    conn_listening,  /** the socket which listens for connections */
-    conn_read,       /** reading in a command line */
-    conn_write,      /** writing out a simple response */
-    conn_nread,      /** reading in a fixed number of bytes */
-    conn_swallow,    /** swallowing unnecessary bytes w/o storing */
-    conn_closing,    /** closing this connection */
-    conn_mwrite,     /** writing out many items sequentially */
-#ifdef USE_REPLICATION
-    conn_repconnect, /* replication */
-    conn_rep_listen, /* */
-    conn_rep_send,   /* */
-    conn_pipe_recv,  /* */
-    conn_pipe_send,  /* */
-#endif /* USE_REPLICATION */
-};
-
-#define NREAD_ADD 1
-#define NREAD_SET 2
-#define NREAD_REPLACE 3
-#define NREAD_APPEND 4
-#define NREAD_PREPEND 5
-#define NREAD_CAS 6
-
+/**
+ * The structure representing a connection into memcached.
+ */
 typedef struct conn conn;
 struct conn {
     int    sfd;
-    int    state;
+    sasl_conn_t *sasl_conn;
+    enum conn_states  state;
+    enum bin_substates substate;
     struct event event;
     short  ev_flags;
     short  which;   /** which events were just triggered */
@@ -188,7 +363,8 @@ struct conn {
     char   *wcurr;
     int    wsize;
     int    wbytes;
-    int    write_and_go; /** which state to go into after finishing current write */
+    /** which state to go into after finishing current write */
+    enum conn_states  write_and_go;
     void   *write_and_free; /** free this memory after finishing writing */
 
     char   *ritem;  /** when we read in an item's value, it goes here */
@@ -203,7 +379,6 @@ struct conn {
      */
 
     void   *item;     /* for commands set/add/replace  */
-    int    item_comm; /* which one is it: set/add/replace */
 
     /* data for the swallow state */
     int    sbytes;    /* how many bytes to swallow */
@@ -229,18 +404,35 @@ struct conn {
     char   **suffixcurr;
     int    suffixleft;
 
+    enum protocol protocol;   /* which protocol this connection speaks */
+    enum network_transport transport; /* what transport is used by this connection */
+
     /* data for UDP clients */
-    bool   udp;       /* is this is a UDP "connection" */
     int    request_id; /* Incoming UDP request ID, if this is a UDP "connection" */
     struct sockaddr request_addr; /* Who sent the most recent request */
     socklen_t request_addr_size;
     unsigned char *hdrbuf; /* udp packet headers */
     int    hdrsize;   /* number of headers' worth of space is allocated */
 
-    int    binary;    /* are we in binary mode */
     bool   noreply;   /* True if the reply should not be sent. */
+    /* current stats command */
+    struct {
+        char *buffer;
+        size_t size;
+        size_t offset;
+    } stats;
+
+    /* Binary protocol stuff */
+    /* This is where the binary header goes */
+    protocol_binary_request_header binary_header;
+    uint64_t cas; /* the cas to return */
+    short cmd; /* current command being processed */
+    int opaque;
+    int keylen;
     conn   *next;     /* Used for generating a list of conn structures */
+    LIBEVENT_THREAD *thread; /* Pointer to the thread object serving this connection */
 };
+
 
 /* current time of day (updated periodically) */
 extern volatile rel_time_t current_time;
@@ -248,147 +440,73 @@ extern volatile rel_time_t current_time;
 /*
  * Functions
  */
-
 void do_accept_new_conns(const bool do_accept);
-conn *do_conn_from_freelist();
-bool do_conn_add_to_freelist(conn *c);
-char *do_suffix_from_freelist();
-bool do_suffix_add_to_freelist(char *s);
-char *do_defer_delete(item *item, time_t exptime);
-void do_run_deferred_deletes(void);
-char *do_add_delta(conn *c, item *item, const bool incr, const int64_t delta,
-                   char *buf);
-int do_store_item(item *item, int comm);
-conn *conn_new(const int sfd, const int init_state, const int event_flags, const int read_buffer_size, const bool is_udp, struct event_base *base);
+enum delta_result_type do_add_delta(conn *c, item *item, const bool incr,
+                                    const int64_t delta, char *buf);
+enum store_item_type do_store_item(item *item, int comm, conn* c);
+conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size, enum network_transport transport, struct event_base *base);
+extern int daemonize(int nochdir, int noclose);
 
 
 #include "stats.h"
 #include "slabs.h"
 #include "assoc.h"
 #include "items.h"
-#include "memcached_dtrace.h"
+#include "trace.h"
+#include "hash.h"
+#include "util.h"
 
 #ifdef USE_REPLICATION
 #include "replication.h"
 #endif /* USE_REPLICATION */
 
 /*
- * In multithreaded mode, we wrap certain functions with lock management and
- * replace the logic of some other functions. All wrapped functions have
- * "mt_" and "do_" variants. In multithreaded mode, the plain version of a
- * function is #define-d to the "mt_" variant, which often just grabs a
- * lock and calls the "do_" function. In singlethreaded mode, the "do_"
- * function is called directly.
- *
  * Functions such as the libevent-related calls that need to do cross-thread
  * communication in multithreaded mode (rather than actually doing the work
  * in the current thread) are called via "dispatch_" frontends, which are
  * also #define-d to directly call the underlying code in singlethreaded mode.
  */
-#ifdef USE_THREADS
 
 void thread_init(int nthreads, struct event_base *main_base);
 int  dispatch_event_add(int thread, conn *c);
-void dispatch_conn_new(int sfd, int init_state, int event_flags, int read_buffer_size, int is_udp);
+void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size, enum network_transport transport);
 
 /* Lock wrappers for cache functions that are called from main loop. */
-char *mt_add_delta(conn *c, item *item, const int incr, const int64_t delta,
-                   char *buf);
-void mt_assoc_move_next_bucket(void);
-void mt_accept_new_conns(const bool do_accept);
-conn *mt_conn_from_freelist(void);
-bool  mt_conn_add_to_freelist(conn *c);
-char *mt_suffix_from_freelist(void);
-bool  mt_suffix_add_to_freelist(char *s);
-char *mt_defer_delete(item *it, time_t exptime);
-int   mt_is_listen_thread(void);
-item *mt_item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
-char *mt_item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes);
-void  mt_item_flush_expired(void);
-item *mt_item_get_notedeleted(const char *key, const size_t nkey, bool *delete_locked);
-int   mt_item_link(item *it);
-void  mt_item_remove(item *it);
-int   mt_item_replace(item *it, item *new_it);
-char *mt_item_stats(int *bytes);
-char *mt_item_stats_sizes(int *bytes);
-void  mt_item_unlink(item *it);
-void  mt_item_update(item *it);
-void  mt_run_deferred_deletes(void);
-void *mt_slabs_alloc(size_t size, unsigned int id);
-void  mt_slabs_free(void *ptr, size_t size, unsigned int id);
-int   mt_slabs_reassign(unsigned char srcid, unsigned char dstid);
-char *mt_slabs_stats(int *buflen);
-void  mt_stats_lock(void);
-void  mt_stats_unlock(void);
-int   mt_store_item(item *item, int comm);
+enum delta_result_type add_delta(conn *c, item *item, const int incr,
+                                 const int64_t delta, char *buf);
+void accept_new_conns(const bool do_accept);
+conn *conn_from_freelist(void);
+bool  conn_add_to_freelist(conn *c);
+int   is_listen_thread(void);
+item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
+char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes);
+void  item_flush_expired(void);
+item *item_get(const char *key, const size_t nkey);
+int   item_link(item *it);
+void  item_remove(item *it);
+int   item_replace(item *it, item *new_it);
+void  item_stats(ADD_STAT add_stats, void *c);
+void  item_stats_sizes(ADD_STAT add_stats, void *c);
+void  item_unlink(item *it);
+void  item_update(item *it);
 
+void STATS_LOCK(void);
+void STATS_UNLOCK(void);
+void threadlocal_stats_reset(void);
+void threadlocal_stats_aggregate(struct thread_stats *stats);
+void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out);
 
-# define add_delta(c,x,y,z,a)        mt_add_delta(c,x,y,z,a)
-# define assoc_move_next_bucket()    mt_assoc_move_next_bucket()
-# define accept_new_conns(x)         mt_accept_new_conns(x)
-# define conn_from_freelist()        mt_conn_from_freelist()
-# define conn_add_to_freelist(x)     mt_conn_add_to_freelist(x)
-# define suffix_from_freelist()      mt_suffix_from_freelist()
-# define suffix_add_to_freelist(x)   mt_suffix_add_to_freelist(x)
-# define defer_delete(x,y)           mt_defer_delete(x,y)
-# define is_listen_thread()          mt_is_listen_thread()
-# define item_alloc(x,y,z,a,b)       mt_item_alloc(x,y,z,a,b)
-# define item_cachedump(x,y,z)       mt_item_cachedump(x,y,z)
-# define item_flush_expired()        mt_item_flush_expired()
-# define item_get_notedeleted(x,y,z) mt_item_get_notedeleted(x,y,z)
-# define item_link(x)                mt_item_link(x)
-# define item_remove(x)              mt_item_remove(x)
-# define item_replace(x,y)           mt_item_replace(x,y)
-# define item_stats(x)               mt_item_stats(x)
-# define item_stats_sizes(x)         mt_item_stats_sizes(x)
-# define item_update(x)              mt_item_update(x)
-# define item_unlink(x)              mt_item_unlink(x)
-# define run_deferred_deletes()      mt_run_deferred_deletes()
-# define slabs_alloc(x,y)            mt_slabs_alloc(x,y)
-# define slabs_free(x,y,z)           mt_slabs_free(x,y,z)
-# define slabs_reassign(x,y)         mt_slabs_reassign(x,y)
-# define slabs_stats(x)              mt_slabs_stats(x)
-# define store_item(x,y)             mt_store_item(x,y)
+/* Stat processing functions */
+void append_stat(const char *name, ADD_STAT add_stats, conn *c,
+                 const char *fmt, ...);
 
-# define STATS_LOCK()                mt_stats_lock()
-# define STATS_UNLOCK()              mt_stats_unlock()
+enum store_item_type store_item(item *item, int comm, conn *c);
 
-#else /* !USE_THREADS */
-
-# define add_delta(c,x,y,z,a)          do_add_delta(c,x,y,z,a)
-# define assoc_move_next_bucket()    do_assoc_move_next_bucket()
-# define accept_new_conns(x)         do_accept_new_conns(x)
-# define conn_from_freelist()        do_conn_from_freelist()
-# define conn_add_to_freelist(x)     do_conn_add_to_freelist(x)
-# define suffix_from_freelist()      do_suffix_from_freelist()
-# define suffix_add_to_freelist(x)   do_suffix_add_to_freelist(x)
-# define defer_delete(x,y)           do_defer_delete(x,y)
-# define dispatch_conn_new(x,y,z,a,b) conn_new(x,y,z,a,b,main_base)
-# define dispatch_event_add(t,c)     event_add(&(c)->event, 0)
-# define is_listen_thread()          1
-# define item_alloc(x,y,z,a,b)       do_item_alloc(x,y,z,a,b)
-# define item_cachedump(x,y,z)       do_item_cachedump(x,y,z)
-# define item_flush_expired()        do_item_flush_expired()
-# define item_get_notedeleted(x,y,z) do_item_get_notedeleted(x,y,z)
-# define item_link(x)                do_item_link(x)
-# define item_remove(x)              do_item_remove(x)
-# define item_replace(x,y)           do_item_replace(x,y)
-# define item_stats(x)               do_item_stats(x)
-# define item_stats_sizes(x)         do_item_stats_sizes(x)
-# define item_unlink(x)              do_item_unlink(x)
-# define item_update(x)              do_item_update(x)
-# define run_deferred_deletes()      do_run_deferred_deletes()
-# define slabs_alloc(x,y)            do_slabs_alloc(x,y)
-# define slabs_free(x,y,z)           do_slabs_free(x,y,z)
-# define slabs_reassign(x,y)         do_slabs_reassign(x,y)
-# define slabs_stats(x)              do_slabs_stats(x)
-# define store_item(x,y)             do_store_item(x,y)
-# define thread_init(x,y)            0
-
-# define STATS_LOCK()                /**/
-# define STATS_UNLOCK()              /**/
-
-#endif /* !USE_THREADS */
+#if HAVE_DROP_PRIVILEGES
+extern void drop_privileges(void);
+#else
+#define drop_privileges()
+#endif
 
 /* If supported, give compiler hints for branch prediction. */
 #if !defined(__GNUC__) || (__GNUC__ == 2 && __GNUC_MINOR__ < 96)
