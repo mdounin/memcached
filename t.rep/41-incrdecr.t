@@ -66,5 +66,5 @@ for my $sock ([$sock_m1, $sock_m2], [$sock_m2, $sock_m1]) {
     print $sock_m "set text 0 0 2\r\nhi\r\n";
     is(scalar <$sock_m>, "STORED\r\n", "stored text");
     print $sock_m "incr text 1\r\n";
-    is(scalar <$sock_m>, "1\r\n", "hi - 1 = 0");
+    like(scalar <$sock_m>, qr/CLIENT_ERROR/, "hi - 1 = error");
 }

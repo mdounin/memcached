@@ -300,6 +300,10 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
         argv[arg++] = "-1";
         argv[arg++] = "-U";
         argv[arg++] = "0";
+#ifdef USE_REPLICATION
+        argv[arg++] = "-X";
+        argv[arg++] = "0";
+#endif
         /* Handle rpmbuild and the like doing this as root */
         if (getuid() == 0) {
             argv[arg++] = "-u";

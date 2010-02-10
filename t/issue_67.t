@@ -41,6 +41,10 @@ sub run_server {
     my $exe = "$builddir/memcached-debug";
     croak("memcached binary doesn't exist.  Haven't run 'make' ?\n") unless -e $exe;
 
+    if (support_replication()) {
+        $args .= ' -X 0';
+    }
+
     my $childpid = fork();
 
     my $cmd = "$builddir/timedrun 10 $exe $args";

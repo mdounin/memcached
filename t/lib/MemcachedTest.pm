@@ -190,6 +190,9 @@ sub new_memcached {
     if ($< == 0) {
         $args .= " -u root";
     }
+    if (support_replication() && $args !~ m/-X/) {
+        $args .= ' -X 0';
+    }
 
     my $childpid = fork();
 
