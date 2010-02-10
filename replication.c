@@ -10,8 +10,6 @@
 #include <string.h>
 #include <errno.h>
 
-int replication_call_defer_del(char *key, size_t keylen, rel_time_t time);
-
 static Q_ITEM *q_freelist  = NULL;
 static int     q_itemcount = 0;
 static pthread_mutex_t replication_queue_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -65,11 +63,6 @@ Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd, bool reuse)
     case REPLICATION_DEL:
         key    = cmd->key;
         keylen = cmd->keylen;
-        break;
-    case REPLICATION_DEFER_DEL:
-        key    = cmd->key;
-        keylen = cmd->keylen;
-        time   = cmd->time;
         break;
     case REPLICATION_FLUSH_ALL:
         break;
@@ -158,15 +151,6 @@ int replication_call_del(char *key, size_t keylen)
     return(replication(REPLICATION_DEL, &r));
 }
 
-int replication_call_defer_del(char *key, size_t keylen, rel_time_t time)
-{
-    R_CMD r;
-    r.key    = key;
-    r.keylen = keylen;
-    r.time   = time;
-    return(replication(REPLICATION_DEFER_DEL, &r));
-}
-
 int replication_call_flush_all()
 {
     R_CMD r;
@@ -226,36 +210,6 @@ static int replication_del(conn *c, char *k)
     p += strlen(s);
     memcpy(p, k, strlen(k));
     p += strlen(k);
-    memcpy(p, n, strlen(n));
-    p += strlen(n);
-    c->wbytes = p - c->wbuf;
-    c->wcurr  = c->wbuf;
-    return(0);
-}
-
-static int replication_defer_del(conn *c, char *k, rel_time_t exp)
-{
-    int   l = 0;
-    char *s = "delete ";
-    char *n = "\r\n";
-    char *p = NULL;
-
-    l += strlen(s);
-    l += strlen(k);
-    l += 1;
-    l += replication_get_num(NULL, exp);
-    l += strlen(n);
-    if(replication_alloc(c,l) == -1){
-        fprintf(stderr, "replication: del malloc error\n");
-        return(-1);
-    }
-    p = c->wbuf + c->wbytes;
-    memcpy(p, s, strlen(s));
-    p += strlen(s);
-    memcpy(p, k, strlen(k));
-    p += strlen(k);
-    *(p++) = ' ';
-    p += replication_get_num(p, exp);
     memcpy(p, n, strlen(n));
     p += strlen(n);
     c->wbytes = p - c->wbuf;
@@ -388,8 +342,6 @@ int replication_cmd(conn *c, Q_ITEM *q)
         return r;
     case REPLICATION_DEL:
         return(replication_del(c, q->key));
-    case REPLICATION_DEFER_DEL:
-        return(replication_defer_del(c, q->key, q->time));
     case REPLICATION_FLUSH_ALL:
         return(replication_flush_all(c, 0));
     case REPLICATION_DEFER_FLUSH_ALL:
