@@ -4468,7 +4468,8 @@ static void sig_handler_cb(int fd, short event, void *arg)
 {
     struct event *signal = arg;
 
-    printf("got signal %d\n", EVENT_SIGNAL(signal));
+    if (settings.verbose)
+        fprintf(stderr, "got signal %d\n", EVENT_SIGNAL(signal));
 
     if (replication_exit()) {
         exit(EXIT_FAILURE);
@@ -5330,7 +5331,8 @@ static int replication_pop(void)
                 }
             }else{
                 if(!rep_exit){
-                    fprintf(stderr,"replication: cleanup start\n");
+                    if (settings.verbose)
+                        fprintf(stderr,"replication: cleanup start\n");
                     rep_exit = 1;
                 }
             }
@@ -5347,7 +5349,8 @@ static int replication_pop(void)
         }else{
             /* finish */
             replication_close();
-            fprintf(stderr,"replication: cleanup complete\n");
+            if (settings.verbose)
+                fprintf(stderr,"replication: cleanup complete\n");
             exit(EXIT_SUCCESS);
         }
     }
