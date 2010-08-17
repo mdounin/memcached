@@ -246,6 +246,7 @@ struct stats {
     uint64_t      get_hits;
     uint64_t      get_misses;
     uint64_t      evictions;
+    uint64_t      reclaimed;
 #if 0
     time_t        started;          /* when the process was started */
 #endif

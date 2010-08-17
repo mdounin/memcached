@@ -7,7 +7,7 @@ use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
 
-Test::More::plan(tests => support_replication() ? 3385 : 3349);
+Test::More::plan(tests => 3361 + (support_replication() ? 36 : 0));
 
 my $server = new_memcached();
 ok($server, "started the server");

@@ -1,6 +1,7 @@
 AC_PREREQ(2.52)
 m4_include([version.m4])
-AC_INIT(memcached, VERSION_NUMBER, brad@danga.com)
+m4_include([m4/c99-backport.m4])
+AC_INIT(memcached, VERSION_NUMBER, memcached@googlegroups.com)
 AC_CANONICAL_SYSTEM
 AC_CONFIG_SRCDIR(memcached.c)
 AM_INIT_AUTOMAKE(AC_PACKAGE_NAME, AC_PACKAGE_VERSION)
@@ -74,13 +75,48 @@ AC_PROG_INSTALL
 AC_ARG_ENABLE(sasl,
   [AS_HELP_STRING([--enable-sasl],[Enable SASL authentication])])
 
+AC_ARG_ENABLE(sasl_pwdb,
+  [AS_HELP_STRING([--enable-sasl-pwdb],[Enable plaintext password db])])
+
+AS_IF([test "x$enable_sasl_pwdb" = "xyes"],
+      [enable_sasl=yes ])
+
+
+dnl **********************************************************************
+dnl DETECT_SASL_CB_GETCONF
+dnl
+dnl check if we can use SASL_CB_GETCONF
+dnl **********************************************************************
+AC_DEFUN([AC_C_DETECT_SASL_CB_GETCONF],
+[
+    AC_CACHE_CHECK([for SASL_CB_GETCONF],
+        [ac_cv_c_sasl_cb_getconf],
+        [AC_TRY_COMPILE(
+            [
+#include <sasl/sasl.h>
+            ], [
+unsigned long val = SASL_CB_GETCONF;
+            ],
+            [ ac_cv_c_sasl_cb_getconf=yes ],
+            [ ac_cv_c_sasl_cb_getconf=no ])
+        ])
+    AS_IF([test "$ac_cv_c_sasl_cb_getconf" = "yes"],
+          [AC_DEFINE([HAVE_SASL_CB_GETCONF], 1,
+                     [Set to nonzero if your SASL implementation supports SASL_CB_GETCONF])])
+])
+
 AC_CHECK_HEADERS([sasl/sasl.h])
 if test "x$enable_sasl" = "xyes"; then
+  AC_C_DETECT_SASL_CB_GETCONF
   AC_DEFINE([ENABLE_SASL],1,[Set to nonzero if you want to include SASL])
-  AC_SEARCH_LIBS([sasl_server_init], [sasl2], [],
+  AC_SEARCH_LIBS([sasl_server_init], [sasl2 sasl], [],
     [
       AC_MSG_ERROR([Failed to locate the library containing sasl_server_init])
     ])
+
+  AS_IF([test "x$enable_sasl_pwdb" = "xyes"],
+        [AC_DEFINE([ENABLE_SASL_PWDB], 1,
+                   [Set to nonzero if you want to enable a SASL pwdb])])
 fi
 
 AC_ARG_ENABLE(dtrace,
@@ -408,9 +444,15 @@ AC_DEFUN([AC_C_ALIGNMENT],
 #include <inttypes.h>
     ], [
        char *buf = malloc(32);
+
        uint64_t *ptr = (uint64_t*)(buf+2);
+       // catch sigbus, etc.
        *ptr = 0x1;
-       return 0;
+
+       // catch unaligned word access (ARM cpus)
+       *buf =  1; *(buf +1) = 2; *(buf + 2) = 2; *(buf + 3) = 3; *(buf + 4) = 4;
+       int* i = (int*)(buf+1);
+       return (84148994 == i) ? 0 : 1;
     ])
   ],[
     ac_cv_c_alignment=none

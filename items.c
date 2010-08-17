@@ -29,6 +29,7 @@ typedef struct {
     unsigned int evicted;
     unsigned int evicted_nonzero;
     rel_time_t evicted_time;
+    unsigned int reclaimed;
     unsigned int outofmemory;
     unsigned int tailrepairs;
 } itemstats_t;
@@ -108,6 +109,10 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
             /* I don't want to actually free the object, just steal
              * the item to avoid to grab the slab mutex twice ;-)
              */
+            STATS_LOCK();
+            stats.reclaimed++;
+            STATS_UNLOCK();
+            itemstats[id].reclaimed++;
             it->refcount = 1;
             do_item_unlink(it);
             /* Initialize the item block: */
@@ -158,6 +163,11 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
 #ifdef USE_REPLICATION
                     replication_call_del(ITEM_key(search), search->nkey);
 #endif /* USE_REPLICATION */
+                } else {
+                    itemstats[id].reclaimed++;
+                    STATS_LOCK();
+                    stats.reclaimed++;
+                    STATS_UNLOCK();
                 }
                 do_item_unlink(search);
                 break;
@@ -280,7 +290,6 @@ static void item_unlink_q(item *it) {
 int do_item_link(item *it) {
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
-    assert(it->nbytes < (1024 * 1024));  /* 1MB max size */
     it->it_flags |= ITEM_LINKED;
     it->time = current_time;
     assoc_insert(it);
@@ -414,6 +423,8 @@ void do_item_stats(ADD_STAT add_stats, void *c) {
                                 "%u", itemstats[i].outofmemory);
             APPEND_NUM_FMT_STAT(fmt, i, "tailrepairs",
                                 "%u", itemstats[i].tailrepairs);;
+            APPEND_NUM_FMT_STAT(fmt, i, "reclaimed",
+                                "%u", itemstats[i].reclaimed);;
         }
     }
 
