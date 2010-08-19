@@ -150,7 +150,7 @@ enum conn_states {
     conn_pipe_recv,  /**< replication command pipe recv */
     conn_pipe_send,  /**< replication command pipe send */
 #endif /* USE_REPLICATION */
-    conn_max_state,  /**< Max state value (used for assertion) */
+    conn_max_state   /**< Max state value (used for assertion) */
 };
 
 enum bin_substates {
@@ -247,9 +247,7 @@ struct stats {
     uint64_t      get_misses;
     uint64_t      evictions;
     uint64_t      reclaimed;
-#if 0
     time_t        started;          /* when the process was started */
-#endif
     bool          accepting_conns;  /* whether we are currently accepting */
     uint64_t      listen_disabled_num;
 };

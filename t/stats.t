@@ -57,11 +57,8 @@ my $sock = $server->sock;
 my $stats = mem_stats($sock);
 
 # Test number of keys
-if (! support_replication()) {
-    is(scalar(keys(%$stats)), 38, "38 stats values");
-} else {
-    is(scalar(keys(%$stats)), 41, "41 stats values");
-}
+is(scalar(keys(%$stats)), 38 + (support_replication() ? 3 : 0),
+   "number of stats values");
 
 # Test initial state
 foreach my $key (qw(curr_items total_items bytes cmd_get cmd_set get_hits evictions get_misses
