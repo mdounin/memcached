@@ -3525,6 +3525,9 @@ static void drive_machine(conn *c) {
 
 #ifdef USE_REPLICATION
     if(rep_exit && (c->state != conn_pipe_recv)){
+        if (c == rep_conn && c->wbytes) {
+            replication_send(c);
+        }
         return;
     }
 #endif /* USE_REPLICATION */
@@ -3888,6 +3891,12 @@ static void drive_machine(conn *c) {
 #endif /* USE_REPLICATION */
         }
     }
+
+#ifdef USE_REPLICATION
+    if (c == rep_conn && c->wbytes) {
+        replication_send(c);
+    }
+#endif /* USE_REPLICATION */
 
     return;
 }
@@ -5279,21 +5288,34 @@ static int replication_marugoto(int f)
 
 static int replication_send(conn *c)
 {
-    while(c->wbytes){
-        int w = write(c->sfd, c->wcurr, c->wbytes);
-        if(w == -1){
-            if(errno == EAGAIN || errno == EINTR){
-            }else{
-                fprintf(stderr,"replication: send error\n");
-                replication_close();
-                break;
-            }
-        }else{
-            c->wbytes -= w;
-            c->wcurr  += w;
-        }
+    int w;
+
+    w = write(c->sfd, c->wcurr, c->wbytes);
+
+    if (w == -1 && !(errno == EAGAIN || errno == EINTR)) {
+        fprintf(stderr,"replication: send error %d\n", errno);
+        replication_close();
+        return -1;
     }
-    return(c->wbytes);
+
+    if (w > 0) {
+        c->wbytes -= w;
+        c->wcurr  += w;
+    }
+
+    if (!update_event(c, (c->wbytes ? EV_WRITE : 0) | EV_READ | EV_PERSIST)) {
+        fprintf(stderr, "replication: couldn't update event\n");
+        replication_close();
+        return -1;
+    }
+
+    if (!update_event(rep_recv, c->wbytes ? 0 : EV_READ | EV_PERSIST)) {
+        fprintf(stderr, "replication: couldn't update event\n");
+        replication_close();
+        return -1;
+    }
+
+    return 0;
 }
 
 static int replication_pop(void)

@@ -177,13 +177,14 @@ static int replication_alloc(conn *c, int s)
 {
     char *p;
     s += c->wbytes;
-    if(c->wsize < s){
+    if(c->wsize < s + (c->wcurr - c->wbuf)){
         while(c->wsize < s)
             c->wsize += 4096;
         if((p = malloc(c->wsize))){
-            memcpy(p, c->wbuf, c->wbytes);
+            memcpy(p, c->wcurr, c->wbytes);
             free(c->wbuf);
             c->wbuf = p;
+            c->wcurr = p;
         }else{
             return(-1);
         }
@@ -205,15 +206,14 @@ static int replication_del(conn *c, char *k)
         fprintf(stderr, "replication: del malloc error\n");
         return(-1);
     }
-    p = c->wbuf + c->wbytes;
+    p = c->wcurr + c->wbytes;
     memcpy(p, s, strlen(s));
     p += strlen(s);
     memcpy(p, k, strlen(k));
     p += strlen(k);
     memcpy(p, n, strlen(n));
     p += strlen(n);
-    c->wbytes = p - c->wbuf;
-    c->wcurr  = c->wbuf;
+    c->wbytes = p - c->wcurr;
     return(0);
 }
 
@@ -258,7 +258,7 @@ static int replication_rep(conn *c, item *it)
         fprintf(stderr, "replication: rep malloc error\n");
         return(-1);
     }
-    p = c->wbuf + c->wbytes;
+    p = c->wcurr + c->wbytes;
     memcpy(p, s, strlen(s));
     p += strlen(s);
     memcpy(p, ITEM_key(it), it->nkey);
@@ -276,8 +276,7 @@ static int replication_rep(conn *c, item *it)
     p += strlen(n);
     memcpy(p, ITEM_data(it), it->nbytes);
     p += it->nbytes;
-    c->wbytes = p - c->wbuf;
-    c->wcurr  = c->wbuf;
+    c->wbytes = p - c->wcurr;
     return(0);
 }
 
@@ -294,15 +293,14 @@ static int replication_flush_all(conn *c, rel_time_t exp)
         fprintf(stderr, "replication: flush_all malloc error\n");
         return(-1);
     }
-    p = c->wbuf + c->wbytes;
+    p = c->wcurr + c->wbytes;
     memcpy(p, s, strlen(s));
     p += strlen(s);
     if (exp > 0)
         p += replication_get_num(p, exp);
     memcpy(p, n, strlen(n));
     p += strlen(n);
-    c->wbytes = p - c->wbuf;
-    c->wcurr  = c->wbuf;
+    c->wbytes = p - c->wcurr;
     return(0);
 }
 
@@ -317,13 +315,12 @@ static int replication_marugoto_end(conn *c)
         fprintf(stderr, "replication: marugoto_end malloc error\n");
         return(-1);
     }
-    p = c->wbuf + c->wbytes;
+    p = c->wcurr + c->wbytes;
     memcpy(p, s, strlen(s));
     p += strlen(s);
     memcpy(p, n, strlen(n));
     p += strlen(n);
-    c->wbytes = p - c->wbuf;
-    c->wcurr  = c->wbuf;
+    c->wbytes = p - c->wcurr;
     return(0);
 }
 
