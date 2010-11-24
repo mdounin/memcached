@@ -1,3 +1,8 @@
+2010-11-24  Maxim Dounin
+
+  * release of repcached-2.3 for memcached-1.4.5
+  * fixed cpu hog on transient network problems
+
 2009-05-26  YASUI Masanobu
   * release of repcached-2.2 for memcached-1.2.8
 

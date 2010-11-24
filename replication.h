@@ -1,6 +1,6 @@
 #ifndef MEMCACHED_REPLICATION_H
 #define MEMCACHED_REPLICATION_H
-#define REPCACHED_VERSION "2.2"
+#define REPCACHED_VERSION "2.3"
 #include <netdb.h>
 
 enum CMD_TYPE {
