@@ -5309,12 +5309,6 @@ static int replication_send(conn *c)
         return -1;
     }
 
-    if (!update_event(rep_recv, c->wbytes ? 0 : EV_READ | EV_PERSIST)) {
-        fprintf(stderr, "replication: couldn't update event\n");
-        replication_close();
-        return -1;
-    }
-
     return 0;
 }
 
