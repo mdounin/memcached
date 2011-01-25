@@ -120,7 +120,6 @@ static void replication_dispatch_close(void);
 static int  replication_marugoto(int);
 static int  replication_send(conn *);
 static int  replication_pop(void);
-static int  replication_push(void);
 static int  replication_exit(void);
 static int  replication_item(Q_ITEM *);
 static pthread_mutex_t replication_pipe_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -5167,37 +5166,13 @@ static int replication_connect(void)
 
 static int replication_close(void)
 {
-    int     c;
-    int     r;
     Q_ITEM *q;
 
     if(settings.verbose > 0)
         fprintf(stderr,"replication: close\n");
     if(rep_recv){
-        rep_recv->rbytes = sizeof(q);
-        rep_recv->rcurr  = rep_recv->rbuf;
-        c = 0;
-        do{
-            r = read(rep_recv->sfd, rep_recv->rcurr, rep_recv->rbytes);
-            if(r == -1){
-                break;
-            }
-            rep_recv->rbytes -= r;
-            rep_recv->rcurr  += r;
-            if(!rep_recv->rbytes){
-                memcpy(&q, rep_recv->rbuf, sizeof(q));
-                rep_recv->rbytes = sizeof(q);
-                rep_recv->rcurr  = rep_recv->rbuf;
-                qi_free(q);
-                c++;
-            }
-        }while(r);
         conn_close(rep_recv);
         rep_recv = NULL;
-        if (settings.verbose > 1) {
-            fprintf(stderr, "replication: qitem free %d items\n", qi_free_list());
-            fprintf(stderr, "replication: close recv %d items\n", c);
-        }
     }
     pthread_mutex_lock(&replication_pipe_lock);
     if(rep_send){
@@ -5207,6 +5182,12 @@ static int replication_close(void)
             fprintf(stderr,"replication: close send\n");
     }
     pthread_mutex_unlock(&replication_pipe_lock);
+    while ((q = replication_queue_pop()) != NULL) {
+        qi_free(q);
+    }
+    if (settings.verbose > 1) {
+        fprintf(stderr, "replication: qitem free %d items\n", qi_free_list());
+    }
     if(rep_conn){
         conn_close(rep_conn);
         rep_conn = NULL;
@@ -5303,10 +5284,22 @@ static int replication_send(conn *c)
         c->wcurr  += w;
     }
 
+    if (c->wbytes < 1024 * 1024 && replication_pop()) {
+        replication_close();
+        return -1;
+    }
+
     if (!update_event(c, (c->wbytes ? EV_WRITE : 0) | EV_READ | EV_PERSIST)) {
         fprintf(stderr, "replication: couldn't update event\n");
         replication_close();
         return -1;
+    }
+
+    if (rep_exit && c->wbytes == 0) {
+        replication_close();
+        if (settings.verbose)
+            fprintf(stderr,"replication: cleanup complete\n");
+        exit(EXIT_SUCCESS);
     }
 
     return 0;
@@ -5315,121 +5308,81 @@ static int replication_send(conn *c)
 static int replication_pop(void)
 {
     int      r;
-    int      c;
-    int      m;
-    Q_ITEM **q;
+    Q_ITEM  *q;
 
-    if(settings.verbose > 1)
+    if (settings.verbose > 1)
         fprintf(stderr, "replication: pop\n");
 
-    if(!rep_recv)
-        return(0);
+    if (!rep_recv)
+        return 0;
 
     r = read(rep_recv->sfd, rep_recv->rbuf, rep_recv->rsize);
-    if(r == -1){
-        if(errno == EAGAIN || errno == EINTR){
-        }else{
-            fprintf(stderr,"replication: pop error %d\n", errno);
-            return(-1);
-        }
-    }if(r == 0){
+
+    if (r == -1 && !(errno == EAGAIN || errno == EINTR)) {
+        fprintf(stderr, "replication: pop error %d\n", errno);
+        return -1;
+    }
+    if (r == 0) {
         /* other end closed, trigger replication_close() */
-        return(-1);
-    }else{
-        c = r / sizeof(Q_ITEM *);
-        m = r % sizeof(Q_ITEM *);
-        q = (Q_ITEM **)(rep_recv->rbuf);
-        while(c--){
-            if(q[c]){
-                if(rep_conn && replication_cmd(rep_conn, q[c])){
-                    replication_item(q[c]); /* error retry */
-                }else{
-                    qi_free(q[c]);
-                }
-            }else{
-                if(!rep_exit){
-                    if (settings.verbose)
-                        fprintf(stderr,"replication: cleanup start\n");
-                    rep_exit = 1;
-                }
-            }
-        }
+        return -1;
     }
-    if(rep_exit){
-        if(rep_conn->wbytes){
-            /* retry */
-            if(replication_exit()){
-                replication_close();
-                fprintf(stderr,"replication: cleanup error\n");
-                exit(EXIT_FAILURE);
-            }
-        }else{
-            /* finish */
-            replication_close();
-            if (settings.verbose)
-                fprintf(stderr,"replication: cleanup complete\n");
-            exit(EXIT_SUCCESS);
-        }
-    }
-    replication_marugoto(0);
-    return(0);
-}
 
-static int replication_push(void)
-{
-    int w;
+    /* process queue */
 
-    while(rep_send->wbytes){
-        w = write(rep_send->sfd, rep_send->wcurr, rep_send->wbytes);
-        if(w == -1){
-            if(errno == EAGAIN || errno == EINTR){
-                fprintf(stderr,"replication: push EAGAIN or EINTR\n");
-            }else{
-                return(-1);
-            }
-        }else{
-            rep_send->wbytes -= w;
-            rep_send->wcurr  += w;
+    while (rep_conn->wbytes < 1024 * 1024 &&
+           (q = replication_queue_pop()) != NULL)
+    {
+        if (replication_cmd(rep_conn, q)) {
+            return -1;
         }
+
+        qi_free(q);
     }
-    rep_send->wcurr = rep_send->wbuf;
-    return(0);
+
+    if (rep_conn->wbytes < 1024 * 1024) {
+        replication_marugoto(0);
+    }
+
+    return 0;
 }
 
 static int replication_exit(void)
 {
+    rep_exit = 1;
     return(replication_item(NULL));
 }
 
 static int replication_item(Q_ITEM *q)
 {
+    int w;
+
     pthread_mutex_lock(&replication_pipe_lock);
     if (!rep_send) {
+        qi_free(q);
         pthread_mutex_unlock(&replication_pipe_lock);
         return 0;
     }
-    if(rep_send->wcurr + rep_send->wbytes + sizeof(q) > rep_send->wbuf + rep_send->wsize){
-        fprintf(stderr,"replication: buffer over fllow\n");
-        if(q){
-            qi_free(q);
-        }
+
+    /* add item to queue */
+
+    if (q) {
+        replication_queue_push(q);
+    }
+
+    /* notify main thread we have more data */
+
+    w = write(rep_send->sfd, "", 1);
+
+    if (w == -1 && !(errno == EAGAIN || errno == EINTR)) {
+        fprintf(stderr,"replication: pipe write error %d\n", errno);
+        qi_free(q);
         pthread_mutex_unlock(&replication_pipe_lock);
         replication_dispatch_close();
-        return(-1);
+        return -1;
     }
-    memcpy(rep_send->wcurr + rep_send->wbytes, &q, sizeof(q));
-    rep_send->wbytes += sizeof(q);
-    if(replication_push()){
-        fprintf(stderr, "replication: push error\n");
-        if(q){
-            qi_free(q);
-        }
-        pthread_mutex_unlock(&replication_pipe_lock);
-        replication_dispatch_close();
-        return(-1);
-    }
+
     pthread_mutex_unlock(&replication_pipe_lock);
-    return(0);
+    return 0;
 }
 
 int replication(enum CMD_TYPE type, R_CMD *cmd)

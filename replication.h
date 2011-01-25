@@ -32,6 +32,9 @@ int     qi_free_list(void);
 int     replication_cmd(conn *, Q_ITEM *);
 int     get_qi_count(void);
 
+void    replication_queue_push(Q_ITEM *);
+Q_ITEM *replication_queue_pop(void);
+
 int replication_call_rep(char *key, size_t keylen);
 int replication_call_del(char *key, size_t keylen);
 int replication_call_flush_all(void);

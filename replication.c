@@ -10,6 +10,8 @@
 #include <string.h>
 #include <errno.h>
 
+static Q_ITEM *q_head      = NULL;
+static Q_ITEM *q_tail      = NULL;
 static Q_ITEM *q_freelist  = NULL;
 static int     q_itemcount = 0;
 static pthread_mutex_t replication_queue_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -122,6 +124,35 @@ int qi_free_list()
     }
     pthread_mutex_unlock(&replication_queue_lock);
     return(c);
+}
+
+void replication_queue_push(Q_ITEM *q)
+{
+    pthread_mutex_lock(&replication_queue_lock);
+    if (q_tail != NULL) {
+        q_tail->next = q;
+    } else {
+        q_head = q;
+    }
+    q_tail = q;
+    q->next = NULL;
+    pthread_mutex_unlock(&replication_queue_lock);
+}
+
+Q_ITEM *replication_queue_pop(void)
+{
+    Q_ITEM *q;
+
+    pthread_mutex_lock(&replication_queue_lock);
+    q = q_head;
+    if (q != NULL) {
+        q_head = q->next;
+        if (q->next == NULL) {
+            q_tail = NULL;
+        }
+    }
+    pthread_mutex_unlock(&replication_queue_lock);
+    return q;
 }
 
 static int replication_get_num(char *p, int n)
