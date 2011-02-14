@@ -1,3 +1,8 @@
+2011-02-14  Maxim Dounin
+
+  * release of repcached-2.3.1 for memcached-1.4.5
+  * fixed another cpu hog on network problems
+
 2010-11-24  Maxim Dounin
 
   * release of repcached-2.3 for memcached-1.4.5
