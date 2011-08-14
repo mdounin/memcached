@@ -77,18 +77,22 @@
 #define TAIL_REPAIR_TIME (3 * 3600)
 
 /* warning: don't use these macros with a function, as it evals its arg twice */
-#define ITEM_get_cas(i) ((uint64_t)(((i)->it_flags & ITEM_CAS) ? \
-                                    *(uint64_t*)&((i)->end[0]) : 0x0))
-#define ITEM_set_cas(i,v) { if ((i)->it_flags & ITEM_CAS) { \
-                          *(uint64_t*)&((i)->end[0]) = v; } }
+#define ITEM_get_cas(i) (((i)->it_flags & ITEM_CAS) ? \
+        (i)->data->cas : (uint64_t)0)
 
-#define ITEM_key(item) (((char*)&((item)->end[0])) \
+#define ITEM_set_cas(i,v) { \
+    if ((i)->it_flags & ITEM_CAS) { \
+        (i)->data->cas = v; \
+    } \
+}
+
+#define ITEM_key(item) (((char*)&((item)->data)) \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
-#define ITEM_suffix(item) ((char*) &((item)->end[0]) + (item)->nkey + 1 \
+#define ITEM_suffix(item) ((char*) &((item)->data) + (item)->nkey + 1 \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
-#define ITEM_data(item) ((char*) &((item)->end[0]) + (item)->nkey + 1 \
+#define ITEM_data(item) ((char*) &((item)->data) + (item)->nkey + 1 \
          + (item)->nsuffix \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
@@ -193,7 +197,7 @@ enum store_item_type {
 };
 
 enum delta_result_type {
-    OK, NON_NUMERIC, EOM
+    OK, NON_NUMERIC, EOM, DELTA_ITEM_NOT_FOUND, DELTA_ITEM_CAS_MISMATCH
 };
 
 /** Time relative to server start. Smaller than time_t on 64-bit systems. */
@@ -272,6 +276,7 @@ struct settings {
     double factor;          /* chunk size growth factor */
     int chunk_size;
     int num_threads;        /* number of worker (without dispatcher) libevent threads to run */
+    int num_threads_per_udp; /* number of worker threads serving each udp socket */
     char prefix_delimiter;  /* character that marks a key prefix (for stats) */
     int detail_enabled;     /* nonzero if we're collecting detailed stats */
     int reqs_per_event;     /* Maximum number of io to process on each
@@ -317,7 +322,12 @@ typedef struct _stritem {
     uint8_t         it_flags;   /* ITEM_* above */
     uint8_t         slabs_clsid;/* which slab class we're in */
     uint8_t         nkey;       /* key length, w/terminating null and padding */
-    void * end[];
+    /* this odd type prevents type-punning issues when we do
+     * the little shuffle to save space when not using CAS. */
+    union {
+        uint64_t cas;
+        char end;
+    } data[];
     /* if it_flags & ITEM_CAS we have 8 bytes CAS */
     /* then null-terminated key */
     /* then " flags length\r\n" (no terminating null) */
@@ -440,8 +450,10 @@ extern volatile rel_time_t current_time;
  * Functions
  */
 void do_accept_new_conns(const bool do_accept);
-enum delta_result_type do_add_delta(conn *c, item *item, const bool incr,
-                                    const int64_t delta, char *buf);
+enum delta_result_type do_add_delta(conn *c, const char *key,
+                                    const size_t nkey, const bool incr,
+                                    const int64_t delta, char *buf,
+                                    uint64_t *cas);
 enum store_item_type do_store_item(item *item, int comm, conn* c);
 conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size, enum network_transport transport, struct event_base *base);
 extern int daemonize(int nochdir, int noclose);
@@ -471,8 +483,10 @@ int  dispatch_event_add(int thread, conn *c);
 void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size, enum network_transport transport);
 
 /* Lock wrappers for cache functions that are called from main loop. */
-enum delta_result_type add_delta(conn *c, item *item, const int incr,
-                                 const int64_t delta, char *buf);
+enum delta_result_type add_delta(conn *c, const char *key,
+                                 const size_t nkey, const int incr,
+                                 const int64_t delta, char *buf,
+                                 uint64_t *cas);
 void accept_new_conns(const bool do_accept);
 conn *conn_from_freelist(void);
 bool  conn_add_to_freelist(conn *c);

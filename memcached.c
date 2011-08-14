@@ -143,6 +143,27 @@ enum transmit_result {
 
 static enum transmit_result transmit(conn *c);
 
+/* This reduces the latency without adding lots of extra wiring to be able to
+ * notify the listener thread of when to listen again.
+ * Also, the clock timer could be broken out into its own thread and we
+ * can block the listener via a condition.
+ */
+static volatile bool allow_new_conns = true;
+static struct event maxconnsevent;
+static void maxconns_handler(const int fd, const short which, void *arg) {
+    struct timeval t = {.tv_sec = 0, .tv_usec = 10000};
+
+    if (allow_new_conns == false) {
+        /* reschedule in 10ms if we need to keep polling */
+        evtimer_set(&maxconnsevent, maxconns_handler, 0);
+        event_base_set(main_base, &maxconnsevent);
+        evtimer_add(&maxconnsevent, &t);
+    } else {
+        evtimer_del(&maxconnsevent);
+        accept_new_conns(true);
+    }
+}
+
 #define REALTIME_MAXDELTA 60*60*24*30
 
 /*
@@ -212,6 +233,7 @@ static void settings_init(void) {
     settings.factor = 1.25;
     settings.chunk_size = 48;         /* space for a modest key and value */
     settings.num_threads = 4;         /* N workers */
+    settings.num_threads_per_udp = 0;
     settings.prefix_delimiter = ':';
     settings.detail_enabled = 0;
     settings.reqs_per_event = 20;
@@ -540,7 +562,9 @@ static void conn_close(conn *c) {
 
     MEMCACHED_CONN_RELEASE(c->sfd);
     close(c->sfd);
-    accept_new_conns(true);
+    pthread_mutex_lock(&conn_lock);
+    allow_new_conns = true;
+    pthread_mutex_unlock(&conn_lock);
     conn_cleanup(c);
 
     /* if the connection has big buffers, just free it */
@@ -808,6 +832,12 @@ static void out_string(conn *c, const char *str) {
     if (settings.verbose > 1)
         fprintf(stderr, ">%d %s\n", c->sfd, str);
 
+    /* Nuke a partial output... */
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    add_msghdr(c);
+
     len = strlen(str);
     if ((len + 2) > c->wsize) {
         /* ought to be always enough. just fail for simplicity */
@@ -1042,6 +1072,9 @@ static void complete_incr_bin(conn *c) {
     item *it;
     char *key;
     size_t nkey;
+    /* Weird magic in add_delta forces me to pad here */
+    char tmpbuf[INCR_MAX_STORAGE_LEN];
+    uint64_t cas = 0;
 
     protocol_binary_response_incr* rsp = (protocol_binary_response_incr*)c->wbuf;
     protocol_binary_request_incr* req = binary_get_request(c);
@@ -1069,70 +1102,62 @@ static void complete_incr_bin(conn *c) {
                 req->message.body.expiration);
     }
 
-    it = item_get(key, nkey);
-    if (it && (c->binary_header.request.cas == 0 ||
-               c->binary_header.request.cas == ITEM_get_cas(it))) {
-        /* Weird magic in add_delta forces me to pad here */
-        char tmpbuf[INCR_MAX_STORAGE_LEN];
-        protocol_binary_response_status st = PROTOCOL_BINARY_RESPONSE_SUCCESS;
-
-        switch(add_delta(c, it, c->cmd == PROTOCOL_BINARY_CMD_INCREMENT,
-                         req->message.body.delta, tmpbuf)) {
-        case OK:
-            break;
-        case NON_NUMERIC:
-            st = PROTOCOL_BINARY_RESPONSE_DELTA_BADVAL;
-            break;
-        case EOM:
-            st = PROTOCOL_BINARY_RESPONSE_ENOMEM;
-            break;
+    if (c->binary_header.request.cas != 0) {
+        cas = c->binary_header.request.cas;
+    }
+    switch(add_delta(c, key, nkey, c->cmd == PROTOCOL_BINARY_CMD_INCREMENT,
+                     req->message.body.delta, tmpbuf,
+                     &cas)) {
+    case OK:
+        rsp->message.body.value = htonll(strtoull(tmpbuf, NULL, 10));
+        if (cas) {
+            c->cas = cas;
         }
+        write_bin_response(c, &rsp->message.body, 0, 0,
+                           sizeof(rsp->message.body.value));
+        break;
+    case NON_NUMERIC:
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_DELTA_BADVAL, 0);
+        break;
+    case EOM:
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
+        break;
+    case DELTA_ITEM_NOT_FOUND:
+        if (req->message.body.expiration != 0xffffffff) {
+            /* Save some room for the response */
+            rsp->message.body.value = htonll(req->message.body.initial);
+            it = item_alloc(key, nkey, 0, realtime(req->message.body.expiration),
+                            INCR_MAX_STORAGE_LEN);
 
-        if (st != PROTOCOL_BINARY_RESPONSE_SUCCESS) {
-            write_bin_error(c, st, 0);
-        } else {
-            rsp->message.body.value = htonll(strtoull(tmpbuf, NULL, 10));
-            c->cas = ITEM_get_cas(it);
-            write_bin_response(c, &rsp->message.body, 0, 0,
-                               sizeof(rsp->message.body.value));
-        }
+            if (it != NULL) {
+                snprintf(ITEM_data(it), INCR_MAX_STORAGE_LEN, "%llu",
+                         (unsigned long long)req->message.body.initial);
 
-        item_remove(it);         /* release our reference */
-    } else if (!it && req->message.body.expiration != 0xffffffff) {
-        /* Save some room for the response */
-        rsp->message.body.value = htonll(req->message.body.initial);
-        it = item_alloc(key, nkey, 0, realtime(req->message.body.expiration),
-                        INCR_MAX_STORAGE_LEN);
-
-        if (it != NULL) {
-            snprintf(ITEM_data(it), INCR_MAX_STORAGE_LEN, "%llu",
-                     (unsigned long long)req->message.body.initial);
-
-            if (store_item(it, NREAD_SET, c)) {
-                c->cas = ITEM_get_cas(it);
-                write_bin_response(c, &rsp->message.body, 0, 0, sizeof(rsp->message.body.value));
+                if (store_item(it, NREAD_ADD, c)) {
+                    c->cas = ITEM_get_cas(it);
+                    write_bin_response(c, &rsp->message.body, 0, 0, sizeof(rsp->message.body.value));
+                } else {
+                    write_bin_error(c, PROTOCOL_BINARY_RESPONSE_NOT_STORED, 0);
+                }
+                item_remove(it);         /* release our reference */
             } else {
-                write_bin_error(c, PROTOCOL_BINARY_RESPONSE_NOT_STORED, 0);
+                write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
             }
-            item_remove(it);         /* release our reference */
         } else {
-            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            if (c->cmd == PROTOCOL_BINARY_CMD_INCREMENT) {
+                c->thread->stats.incr_misses++;
+            } else {
+                c->thread->stats.decr_misses++;
+            }
+            pthread_mutex_unlock(&c->thread->stats.mutex);
+
+            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, 0);
         }
-    } else if (it) {
-        /* incorrect CAS */
-        item_remove(it);         /* release our reference */
+        break;
+    case DELTA_ITEM_CAS_MISMATCH:
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS, 0);
-    } else {
-
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        if (c->cmd == PROTOCOL_BINARY_CMD_INCREMENT) {
-            c->thread->stats.incr_misses++;
-        } else {
-            c->thread->stats.decr_misses++;
-        }
-        pthread_mutex_unlock(&c->thread->stats.mutex);
-
-        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, 0);
+        break;
     }
 }
 
@@ -2425,6 +2450,7 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("uptime", "%u", now);
     APPEND_STAT("time", "%ld", now + (long)process_started);
     APPEND_STAT("version", "%s", VERSION);
+    APPEND_STAT("libevent", "%s", event_get_version());
     APPEND_STAT("pointer_size", "%d", (int)(8 * sizeof(void *)));
 
 #ifndef WIN32
@@ -2486,6 +2512,7 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("growth_factor", "%.2f", settings.factor);
     APPEND_STAT("chunk_size", "%d", settings.chunk_size);
     APPEND_STAT("num_threads", "%d", settings.num_threads);
+    APPEND_STAT("num_threads_per_udp", "%d", settings.num_threads_per_udp);
     APPEND_STAT("stat_key_prefix", "%c", settings.prefix_delimiter);
     APPEND_STAT("detail_enabled", "%s",
                 settings.detail_enabled ? "yes" : "no");
@@ -2815,7 +2842,6 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 
 static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const bool incr) {
     char temp[INCR_MAX_STORAGE_LEN];
-    item *it;
     uint64_t delta;
     char *key;
     size_t nkey;
@@ -2837,8 +2863,17 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
         return;
     }
 
-    it = item_get(key, nkey);
-    if (!it) {
+    switch(add_delta(c, key, nkey, incr, delta, temp, NULL)) {
+    case OK:
+        out_string(c, temp);
+        break;
+    case NON_NUMERIC:
+        out_string(c, "CLIENT_ERROR cannot increment or decrement non-numeric value");
+        break;
+    case EOM:
+        out_string(c, "SERVER_ERROR out of memory");
+        break;
+    case DELTA_ITEM_NOT_FOUND:
         pthread_mutex_lock(&c->thread->stats.mutex);
         if (incr) {
             c->thread->stats.incr_misses++;
@@ -2848,26 +2883,10 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         out_string(c, "NOT_FOUND");
-        return;
+        break;
+    case DELTA_ITEM_CAS_MISMATCH:
+        break; /* Should never get here */
     }
-
-    switch(add_delta(c, it, incr, delta, temp)) {
-    case OK:
-        out_string(c, temp);
-#ifdef USE_REPLICATION
-        if( c != rep_conn){
-            replication_call_rep(ITEM_key(it), it->nkey);
-        }
-#endif /* USE_REPLICATION */
-        break;
-    case NON_NUMERIC:
-        out_string(c, "CLIENT_ERROR cannot increment or decrement non-numeric value");
-        break;
-    case EOM:
-        out_string(c, "SERVER_ERROR out of memory");
-        break;
-    }
-    item_remove(it);         /* release our reference */
 }
 
 /*
@@ -2881,15 +2900,28 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
  *
  * returns a response string to send back to the client.
  */
-enum delta_result_type do_add_delta(conn *c, item *it, const bool incr,
-                                    const int64_t delta, char *buf) {
+enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
+                                    const bool incr, const int64_t delta,
+                                    char *buf, uint64_t *cas) {
     char *ptr;
     uint64_t value;
     int res;
+    item *it;
+
+    it = do_item_get(key, nkey);
+    if (!it) {
+        return DELTA_ITEM_NOT_FOUND;
+    }
+
+    if (cas != NULL && *cas != 0 && ITEM_get_cas(it) != *cas) {
+        do_item_remove(it);
+        return DELTA_ITEM_CAS_MISMATCH;
+    }
 
     ptr = ITEM_data(it);
 
     if (!safe_strtoull(ptr, &value)) {
+        do_item_remove(it);
         return NON_NUMERIC;
     }
 
@@ -2915,10 +2947,11 @@ enum delta_result_type do_add_delta(conn *c, item *it, const bool incr,
 
     snprintf(buf, INCR_MAX_STORAGE_LEN, "%llu", (unsigned long long)value);
     res = strlen(buf);
-    if (res + 2 > it->nbytes) { /* need to realloc */
+    if (res + 2 > it->nbytes || it->refcount != 1) { /* need to realloc */
         item *new_it;
         new_it = do_item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2 );
         if (new_it == 0) {
+            do_item_remove(it);
             return EOM;
         }
         memcpy(ITEM_data(new_it), buf, res);
@@ -2934,6 +2967,16 @@ enum delta_result_type do_add_delta(conn *c, item *it, const bool incr,
         memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
     }
 
+#ifdef USE_REPLICATION
+    if (c != rep_conn) {
+        replication_call_rep(ITEM_key(it), it->nkey);
+    }
+#endif /* USE_REPLICATION */
+
+    if (cas) {
+        *cas = ITEM_get_cas(it);    /* swap the incoming CAS value */
+    }
+    do_item_remove(it);         /* release our reference */
     return OK;
 }
 
@@ -3442,6 +3485,8 @@ void do_accept_new_conns(const bool do_accept) {
         stats.accepting_conns = false;
         stats.listen_disabled_num++;
         STATS_UNLOCK();
+        allow_new_conns = false;
+        maxconns_handler(0, 0, 0);
     }
 }
 
@@ -3976,13 +4021,16 @@ static void maximize_sndbuf(const int sfd) {
 
 /**
  * Create a socket and bind it to a specific port number
+ * @param interface the interface to bind to
  * @param port the port number to bind to
  * @param transport the transport protocol (TCP / UDP)
  * @param portnumber_file A filepointer to write the port numbers to
  *        when they are successfully added to the list of ports we
  *        listen on.
  */
-static int server_socket(int port, enum network_transport transport,
+static int server_socket(const char *interface,
+                         int port,
+                         enum network_transport transport,
                          FILE *portnumber_file) {
     int sfd;
     struct linger ling = {0, 0};
@@ -4001,7 +4049,7 @@ static int server_socket(int port, enum network_transport transport,
         port = 0;
     }
     snprintf(port_buf, sizeof(port_buf), "%d", port);
-    error= getaddrinfo(settings.inter, port_buf, &hints, &ai);
+    error= getaddrinfo(interface, port_buf, &hints, &ai);
     if (error != 0) {
         if (error != EAI_SYSTEM)
           fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
@@ -4089,7 +4137,7 @@ static int server_socket(int port, enum network_transport transport,
         if (IS_UDP(transport)) {
             int c;
 
-            for (c = 0; c < settings.num_threads; c++) {
+            for (c = 0; c < settings.num_threads_per_udp; c++) {
                 /* this is guaranteed to hit all threads because we round-robin */
                 dispatch_conn_new(sfd, conn_read, EV_READ | EV_PERSIST,
                                   UDP_READ_BUFFER_SIZE, transport);
@@ -4110,6 +4158,43 @@ static int server_socket(int port, enum network_transport transport,
 
     /* Return zero iff we detected no errors in starting up connections */
     return success == 0;
+}
+
+static int server_sockets(int port, enum network_transport transport,
+                          FILE *portnumber_file) {
+    if (settings.inter == NULL) {
+        return server_socket(settings.inter, port, transport, portnumber_file);
+    } else {
+        // tokenize them and bind to each one of them..
+        char *b;
+        int ret = 0;
+        char *list = strdup(settings.inter);
+
+        if (list == NULL) {
+            fprintf(stderr, "Failed to allocate memory for parsing server interface string\n");
+            return 1;
+        }
+        for (char *p = strtok_r(list, ";,", &b);
+             p != NULL;
+             p = strtok_r(NULL, ";,", &b)) {
+            int the_port = port;
+            char *s = strchr(p, ':');
+            if (s != NULL) {
+                *s = '\0';
+                ++s;
+                if (!safe_strtol(s, &the_port)) {
+                    fprintf(stderr, "Invalid port number: \"%s\"", s);
+                    return 1;
+                }
+            }
+            if (strcmp(p, "*") == 0) {
+                p = NULL;
+            }
+            ret |= server_socket(p, the_port, transport, portnumber_file);
+        }
+        free(list);
+        return ret;
+    }
 }
 
 static int new_socket_unix(void) {
@@ -4319,7 +4404,12 @@ static void usage(void) {
            "-U <num>      UDP port number to listen on (default: 11211, 0 is off)\n"
            "-s <file>     UNIX socket path to listen on (disables network support)\n"
            "-a <mask>     access mask for UNIX socket, in octal (default: 0700)\n"
-           "-l <ip_addr>  interface to listen on (default: INADDR_ANY, all addresses)\n"
+           "-l <addr>     interface to listen on (default: INADDR_ANY, all addresses)\n"
+           "              <addr> may be specified as host:port. If you don't specify\n"
+           "              a port number, the value you specified with -p or -U is\n"
+           "              used. You may specify multiple addresses separated by comma\n"
+           "              or by using -l multiple times\n"
+
            "-d            run as a daemon\n"
            "-r            maximize core file limit\n"
            "-u <username> assume identity of <username> (only when run as root)\n"
@@ -4440,20 +4530,29 @@ static void usage_license(void) {
     return;
 }
 
-static void save_pid(const pid_t pid, const char *pid_file) {
+static void save_pid(const char *pid_file) {
     FILE *fp;
-    if (pid_file == NULL)
-        return;
+    if (access(pid_file, F_OK) == 0) {
+        if ((fp = fopen(pid_file, "r")) != NULL) {
+            char buffer[1024];
+            if (fgets(buffer, sizeof(buffer), fp) != NULL) {
+                unsigned int pid;
+                if (safe_strtoul(buffer, &pid) && kill((pid_t)pid, 0) == 0) {
+                    fprintf(stderr, "WARNING: The pid file contained the following (running) pid: %u\n", pid);
+                }
+            }
+            fclose(fp);
+        }
+    }
 
     if ((fp = fopen(pid_file, "w")) == NULL) {
         vperror("Could not open the pid file %s for writing", pid_file);
         return;
     }
 
-    fprintf(fp,"%ld\n", (long)pid);
+    fprintf(fp,"%ld\n", (long)getpid());
     if (fclose(fp) == -1) {
         vperror("Could not close the pid file %s", pid_file);
-        return;
     }
 }
 
@@ -4577,7 +4676,7 @@ static void create_listening_sockets(void)
         }
 
         errno = 0;
-        if (settings.port && server_socket(settings.port, tcp_transport,
+        if (settings.port && server_sockets(settings.port, tcp_transport,
                                            portnumber_file)) {
             vperror("failed to listen on TCP port %d", settings.port);
             exit(EX_OSERR);
@@ -4585,7 +4684,7 @@ static void create_listening_sockets(void)
 
         /* create the UDP listening socket and bind it */
         errno = 0;
-        if (settings.udpport && server_socket(settings.udpport, udp_transport,
+        if (settings.udpport && server_sockets(settings.udpport, udp_transport,
                                               portnumber_file)) {
             vperror("failed to listen on UDP port %d", settings.udpport);
             exit(EX_OSERR);
@@ -4596,6 +4695,28 @@ static void create_listening_sockets(void)
             rename(temp_portnumber_filename, portnumber_filename);
         }
     }
+}
+
+/**
+ * Do basic sanity check of the runtime environment
+ * @return true if no errors found, false if we can't use this env
+ */
+static bool sanitycheck(void) {
+    /* One of our biggest problems is old and bogus libevents */
+    const char *ever = event_get_version();
+    if (ever != NULL) {
+        if (strncmp(ever, "1.", 2) == 0) {
+            /* Require at least 1.3 (that's still a couple of years old) */
+            if ((ever[2] == '1' || ever[2] == '2') && !isdigit(ever[3])) {
+                fprintf(stderr, "You are using libevent %s.\nPlease upgrade to"
+                        " a more recent version (1.3 or newer)\n",
+                        event_get_version());
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 int main (int argc, char **argv) {
@@ -4623,6 +4744,10 @@ int main (int argc, char **argv) {
     bool protocol_specified = false;
     bool tcp_specified = false;
     bool udp_specified = false;
+
+    if (!sanitycheck()) {
+        return EX_OSERR;
+    }
 
     /* handle SIGINT */
     signal(SIGINT, sig_handler);
@@ -4706,7 +4831,19 @@ int main (int argc, char **argv) {
             settings.verbose++;
             break;
         case 'l':
-            settings.inter= strdup(optarg);
+            if (settings.inter != NULL) {
+                size_t len = strlen(settings.inter) + strlen(optarg) + 2;
+                char *p = malloc(len);
+                if (p == NULL) {
+                    fprintf(stderr, "Failed to allocate memory\n");
+                    return 1;
+                }
+                snprintf(p, len, "%s,%s", settings.inter, optarg);
+                free(settings.inter);
+                settings.inter = p;
+            } else {
+                settings.inter= strdup(optarg);
+            }
             break;
         case 'd':
             do_daemonize = true;
@@ -4859,6 +4996,16 @@ int main (int argc, char **argv) {
         }
     }
 
+    /*
+     * Use one workerthread to serve each UDP port if the user specified
+     * multiple ports
+     */
+    if (settings.inter != NULL && strchr(settings.inter, ',')) {
+        settings.num_threads_per_udp = 1;
+    } else {
+        settings.num_threads_per_udp = settings.num_threads;
+    }
+
     if (settings.sasl) {
         if (!protocol_specified) {
             settings.binding_protocol = binary_prot;
@@ -4998,15 +5145,11 @@ int main (int argc, char **argv) {
     }
     /* start up worker threads if MT mode */
     thread_init(settings.num_threads, main_base);
-    /* save the PID in if we're a daemon, do this after thread_init due to
-       a file descriptor handling bug somewhere in libevent */
 
     if (start_assoc_maintenance_thread() == -1) {
         exit(EXIT_FAILURE);
     }
 
-    if (do_daemonize)
-        save_pid(getpid(), pid_file);
     /* initialise clock event */
     clock_handler(0, 0, 0);
 
@@ -5025,6 +5168,10 @@ int main (int argc, char **argv) {
 #else
     create_listening_sockets();
 #endif
+
+    if (pid_file != NULL) {
+        save_pid(pid_file);
+    }
 
     /* Drop privileges no longer needed */
     drop_privileges();

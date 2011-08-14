@@ -43,24 +43,9 @@ dnl sets the $SUNCC variable to "yes" or "no"
 dnl **********************************************************************
 AC_DEFUN([DETECT_SUNCC],
 [
-    SUNCC="no"
-    AC_MSG_CHECKING([for Sun cc in use])
-    AC_RUN_IFELSE(
-      [AC_LANG_PROGRAM([], [dnl
-#ifdef __SUNPRO_C
-   return 0;
-#else
-   return 1;
-#endif
-      ])
-    ],[
-       AC_MSG_RESULT([yes])
-       [$1]
-       SUNCC="yes"
-    ], [
-       AC_MSG_RESULT([no])
-       [$2]
-    ])
+    AC_CHECK_DECL([__SUNPRO_C], [SUNCC="yes"], [SUNCC="no"])
+    AS_IF(test "x$SUNCC" = "xyes", [$1], [$2])
+
 ])
 
 DETECT_SUNCC([CFLAGS="-mt $CFLAGS"], [])
@@ -250,6 +235,11 @@ AC_CACHE_CHECK([for libevent directory], ac_cv_libevent_dir, [
     if test $libevent_linked = yes; then
        if test ! -z "$ledir" ; then
          ac_cv_libevent_dir=$ledir
+	 _myos=`echo $target_os | cut -f 1 -d .`
+	 AS_IF(test "$SUNCC" = "yes" -o "x$_myos" = "xsolaris2",
+               [saved_LDFLAGS="$saved_LDFLAGS -Wl,-R$ledir/lib"],
+               [AS_IF(test "$GCC" = "yes",
+                     [saved_LDFLAGS="$saved_LDFLAGS -Wl,-rpath=$ledir/lib"])])
        else
          ac_cv_libevent_dir="(system)"
        fi
@@ -392,8 +382,7 @@ AC_DEFUN([AC_C_HTONLL],
 [
     AC_MSG_CHECKING([for htonll])
     have_htoll="no"
-    AC_RUN_IFELSE([
-       AC_LANG_PROGRAM([
+    AC_TRY_LINK([
 #include <sys/types.h>
 #include <netinet/in.h>
 #ifdef HAVE_INTTYPES_H
@@ -401,10 +390,11 @@ AC_DEFUN([AC_C_HTONLL],
 #endif
        ], [
           return htonll(0);
-       ])
+       ], [
+          have_htoll="yes"
+          AC_DEFINE([HAVE_HTONLL], [1], [Have ntohll])
     ], [
-      have_htoll="yes"
-      AC_DEFINE([HAVE_HTONLL], [1], [Have ntohll])
+          have_htoll="no"
     ])
 
     AC_MSG_RESULT([$have_htoll])
@@ -456,6 +446,8 @@ AC_DEFUN([AC_C_ALIGNMENT],
     ])
   ],[
     ac_cv_c_alignment=none
+  ],[
+    ac_cv_c_alignment=need
   ],[
     ac_cv_c_alignment=need
   ])
