@@ -21,7 +21,7 @@ for my $sock ([$sock_m1, $sock_m2], [$sock_m2, $sock_m1]) {
     sync_get_is($sock_m, $sock_b, "foo", undef);
 
     # and the other form, specifying a flush_all time...
-    my $expire = 3;
+    my $expire = 4;
     print $sock_m "flush_all $expire\r\n";
     is(scalar <$sock_m>, "OK\r\n", "did flush_all in future");
 
