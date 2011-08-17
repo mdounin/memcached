@@ -95,11 +95,6 @@ static int add_iov(conn *c, const void *buf, int len);
 static int add_msghdr(conn *c);
 
 
-/* time handling */
-static void set_current_time(void);  /* update the global variable holding
-                              global 32-bit seconds-since-start time
-                              (to avoid 64 bit time_t) */
-
 static void conn_free(conn *c);
 
 #ifdef USE_REPLICATION
@@ -153,7 +148,7 @@ static struct event maxconnsevent;
 static void maxconns_handler(const int fd, const short which, void *arg) {
     struct timeval t = {.tv_sec = 0, .tv_usec = 10000};
 
-    if (allow_new_conns == false) {
+    if (fd == -42 || allow_new_conns == false) {
         /* reschedule in 10ms if we need to keep polling */
         evtimer_set(&maxconnsevent, maxconns_handler, 0);
         event_base_set(main_base, &maxconnsevent);
@@ -525,6 +520,10 @@ static void conn_cleanup(conn *c) {
         sasl_dispose(&c->sasl_conn);
         c->sasl_conn = NULL;
     }
+
+    if (IS_UDP(c->transport)) {
+        conn_set_state(c, conn_read);
+    }
 }
 
 /*
@@ -674,11 +673,10 @@ static void conn_set_state(conn *c, enum conn_states state) {
                     state_text(state));
         }
 
-        c->state = state;
-
         if (state == conn_write || state == conn_mwrite) {
             MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->wbuf, c->wbytes);
         }
+        c->state = state;
     }
 }
 
@@ -2050,8 +2048,6 @@ static void process_bin_flush(conn *c) {
         exptime = ntohl(req->message.body.expiration);
     }
 
-    set_current_time();
-
     if (exptime > 0) {
         settings.oldest_live = realtime(exptime) - 1;
     } else {
@@ -2790,6 +2786,12 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     /* Ubuntu 8.04 breaks when I pass exptime to safe_strtol */
     exptime = exptime_int;
 
+    /* Negative exptimes can underflow and end up immortal. realtime() will
+       immediately expire values that are greater than REALTIME_MAXDELTA, but less
+       than process_started, so lets aim for that. */
+    if (exptime < 0)
+        exptime = REALTIME_MAXDELTA + 1;
+
     // does cas value exist?
     if (handle_cas) {
         if (!safe_strtoull(tokens[5].value, &req_cas_id)) {
@@ -3137,7 +3139,6 @@ static void process_command(conn *c, char *command) {
 
     } else if (ntokens >= 2 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0)) {
         time_t exptime = 0;
-        set_current_time();
 
         set_noreply_maybe(c, tokens, ntokens);
 
@@ -3362,7 +3363,7 @@ static enum try_read_result try_read_udp(conn *c) {
         res -= 8;
         memmove(c->rbuf, c->rbuf + 8, res);
 
-        c->rbytes += res;
+        c->rbytes = res;
         c->rcurr = c->rbuf;
         return READ_DATA_RECEIVED;
     }
@@ -3486,7 +3487,7 @@ void do_accept_new_conns(const bool do_accept) {
         stats.listen_disabled_num++;
         STATS_UNLOCK();
         allow_new_conns = false;
-        maxconns_handler(0, 0, 0);
+        maxconns_handler(-42, 0, 0);
     }
 }
 
@@ -4369,30 +4370,52 @@ static void server_close_replication(void) {
 volatile rel_time_t current_time;
 static struct event clockevent;
 
-/* time-sensitive callers can call it by hand with this, outside the normal ever-1-second timer */
-static void set_current_time(void) {
-    struct timeval timer;
-
-    gettimeofday(&timer, NULL);
-    current_time = (rel_time_t) (timer.tv_sec - process_started);
-}
-
+/* libevent uses a monotonic clock when available for event scheduling. Aside
+ * from jitter, simply ticking our internal timer here is accurate enough.
+ * Note that users who are setting explicit dates for expiration times *must*
+ * ensure their clocks are correct before starting memcached. */
 static void clock_handler(const int fd, const short which, void *arg) {
     struct timeval t = {.tv_sec = 1, .tv_usec = 0};
     static bool initialized = false;
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+    static bool monotonic = false;
+    static time_t monotonic_start;
+#endif
 
     if (initialized) {
         /* only delete the event if it's actually there. */
         evtimer_del(&clockevent);
     } else {
         initialized = true;
+        /* process_started is initialized to time() - 2. We initialize to 1 so
+         * flush_all won't underflow during tests. */
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+            monotonic = true;
+            monotonic_start = ts.tv_sec - 2;
+        }
+#endif
     }
 
     evtimer_set(&clockevent, clock_handler, 0);
     event_base_set(main_base, &clockevent);
     evtimer_add(&clockevent, &t);
 
-    set_current_time();
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+    if (monotonic) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
+            return;
+        current_time = (rel_time_t) (ts.tv_sec - monotonic_start);
+        return;
+    }
+#endif
+    {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        current_time = (rel_time_t) (tv.tv_sec - process_started);
+    }
 }
 
 static void usage(void) {

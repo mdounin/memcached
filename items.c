@@ -99,12 +99,14 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
     /* do a quick check if we have any expired items in the tail.. */
     int tries = 50;
     item *search;
+    rel_time_t oldest_live = settings.oldest_live;
 
     for (search = tails[id];
          tries > 0 && search != NULL;
          tries--, search=search->prev) {
         if (search->refcount == 0 &&
-            (search->exptime != 0 && search->exptime < current_time)) {
+            ((search->time < oldest_live) || // dead by flush
+             (search->exptime != 0 && search->exptime < current_time))) {
             it = search;
             /* I don't want to actually free the object, just steal
              * the item to avoid to grab the slab mutex twice ;-)
@@ -243,8 +245,13 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
     char prefix[40];
     uint8_t nsuffix;
 
-    return slabs_clsid(item_make_header(nkey + 1, flags, nbytes,
-                                        prefix, &nsuffix)) != 0;
+    size_t ntotal = item_make_header(nkey + 1, flags, nbytes,
+                                     prefix, &nsuffix);
+    if (settings.use_cas) {
+        ntotal += sizeof(uint64_t);
+    }
+
+    return slabs_clsid(ntotal) != 0;
 }
 
 static void item_link_q(item *it) { /* item is the new head */

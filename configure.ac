@@ -187,6 +187,14 @@ return sizeof(void*) == 8 ? 0 : 1;
     ])
 fi
 
+# Issue 213: Search for clock_gettime to help people linking
+#            with a static version of libevent
+AC_SEARCH_LIBS(clock_gettime, rt)
+# Issue 214: Search for the network libraries _before_ searching
+#            for libevent (to help people linking with static libevent)
+AC_SEARCH_LIBS(socket, socket)
+AC_SEARCH_LIBS(gethostbyname, nsl)
+
 trylibeventdir=""
 AC_ARG_WITH(libevent,
        [  --with-libevent=PATH     Specify path to libevent installation ],
@@ -209,7 +217,7 @@ AC_CACHE_CHECK([for libevent directory], ac_cv_libevent_dir, [
   le_found=no
   for ledir in $trylibeventdir "" $prefix /usr/local ; do
     LDFLAGS="$saved_LDFLAGS"
-    LIBS="$saved_LIBS -levent"
+    LIBS="-levent $saved_LIBS"
 
     # Skip the directory if it isn't there.
     if test ! -z "$ledir" -a ! -d "$ledir" ; then
@@ -235,8 +243,8 @@ AC_CACHE_CHECK([for libevent directory], ac_cv_libevent_dir, [
     if test $libevent_linked = yes; then
        if test ! -z "$ledir" ; then
          ac_cv_libevent_dir=$ledir
-	 _myos=`echo $target_os | cut -f 1 -d .`
-	 AS_IF(test "$SUNCC" = "yes" -o "x$_myos" = "xsolaris2",
+         _myos=`echo $target_os | cut -f 1 -d .`
+         AS_IF(test "$SUNCC" = "yes" -o "x$_myos" = "xsolaris2",
                [saved_LDFLAGS="$saved_LDFLAGS -Wl,-R$ledir/lib"],
                [AS_IF(test "$GCC" = "yes",
                      [saved_LDFLAGS="$saved_LDFLAGS -Wl,-rpath=$ledir/lib"])])
@@ -257,7 +265,7 @@ AC_CACHE_CHECK([for libevent directory], ac_cv_libevent_dir, [
 ])
   fi
 ])
-LIBS="$LIBS -levent"
+LIBS="-levent $LIBS"
 if test $ac_cv_libevent_dir != "(system)"; then
   if test -d "$ac_cv_libevent_dir/lib" ; then
     LDFLAGS="-L$ac_cv_libevent_dir/lib $LDFLAGS"
@@ -275,8 +283,6 @@ fi
 
 dnl ----------------------------------------------------------------------------
 
-AC_SEARCH_LIBS(socket, socket)
-AC_SEARCH_LIBS(gethostbyname, nsl)
 AC_SEARCH_LIBS(umem_cache_create, umem)
 AC_SEARCH_LIBS(gethugepagesizes, hugetlbfs)
 
@@ -424,6 +430,7 @@ AC_CHECK_FUNCS(mlockall)
 AC_CHECK_FUNCS(getpagesizes)
 AC_CHECK_FUNCS(memcntl)
 AC_CHECK_FUNCS(sigignore)
+AC_CHECK_FUNCS(clock_gettime)
 
 AC_DEFUN([AC_C_ALIGNMENT],
 [AC_CACHE_CHECK(for alignment, ac_cv_c_alignment,
