@@ -58,7 +58,7 @@ my $sock = $server->sock;
 my $stats = mem_stats($sock);
 
 # Test number of keys
-is(scalar(keys(%$stats)), 39 + (support_replication() ? 3 : 0),
+is(scalar(keys(%$stats)), 48 + (support_replication() ? 3 : 0),
    "number of stats values");
 
 # Test initial state

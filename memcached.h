@@ -60,6 +60,9 @@
 #define MIN_BIN_PKT_LENGTH 16
 #define BIN_PKT_HDR_WORDS (MIN_BIN_PKT_LENGTH/sizeof(uint32_t))
 
+/* Initial power multiplier for the hash table */
+#define HASHPOWER_DEFAULT 16
+
 /* unistd.h is here */
 #if HAVE_UNISTD_H
 # include <unistd.h>
@@ -168,7 +171,8 @@ enum bin_substates {
     bin_reading_incr_header,
     bin_read_flush_exptime,
     bin_reading_sasl_auth,
-    bin_reading_sasl_auth_data
+    bin_reading_sasl_auth_data,
+    bin_reading_touch_key,
 };
 
 enum protocol {
@@ -207,6 +211,7 @@ typedef unsigned int rel_time_t;
 struct slab_stats {
     uint64_t  set_cmds;
     uint64_t  get_hits;
+    uint64_t  touch_hits;
     uint64_t  delete_hits;
     uint64_t  cas_hits;
     uint64_t  cas_badval;
@@ -221,6 +226,8 @@ struct thread_stats {
     pthread_mutex_t   mutex;
     uint64_t          get_cmds;
     uint64_t          get_misses;
+    uint64_t          touch_cmds;
+    uint64_t          touch_misses;
     uint64_t          delete_misses;
     uint64_t          incr_misses;
     uint64_t          decr_misses;
@@ -244,16 +251,26 @@ struct stats {
     uint64_t      curr_bytes;
     unsigned int  curr_conns;
     unsigned int  total_conns;
+    uint64_t      rejected_conns;
+    unsigned int  reserved_fds;
     unsigned int  conn_structs;
     uint64_t      get_cmds;
     uint64_t      set_cmds;
+    uint64_t      touch_cmds;
     uint64_t      get_hits;
     uint64_t      get_misses;
+    uint64_t      touch_hits;
+    uint64_t      touch_misses;
     uint64_t      evictions;
     uint64_t      reclaimed;
     time_t        started;          /* when the process was started */
     bool          accepting_conns;  /* whether we are currently accepting */
     uint64_t      listen_disabled_num;
+    unsigned int  hash_power_level; /* Better hope it's not over 9000 */
+    uint64_t      hash_bytes;       /* size used for hash tables */
+    bool          hash_is_expanding; /* If the hash table is being expanded */
+    uint64_t      expired_unfetched; /* items reclaimed but never touched */
+    uint64_t      evicted_unfetched; /* items evicted but never touched */
 };
 
 #define MAX_VERBOSITY_LEVEL 2
@@ -286,6 +303,8 @@ struct settings {
     int backlog;
     int item_size_max;        /* Maximum item size, and upper end for slabs */
     bool sasl;              /* SASL on/off */
+    bool maxconns_fast;     /* Whether or not to early close connections */
+    int hashpower_init;     /* Starting hash power level */
 #ifdef USE_REPLICATION
     struct in_addr rep_addr;    /* replication addr */
     int rep_port;               /* replication port */
@@ -302,6 +321,8 @@ extern struct settings settings;
 
 /* temp */
 #define ITEM_SLABBED 4
+
+#define ITEM_FETCHED 8
 
 #ifdef USE_REPLICATION
 #define ITEM_REPDATA 128
@@ -495,6 +516,7 @@ item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbyt
 char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes);
 void  item_flush_expired(void);
 item *item_get(const char *key, const size_t nkey);
+item *item_touch(const char *key, const size_t nkey, uint32_t exptime);
 int   item_link(item *it);
 void  item_remove(item *it);
 int   item_replace(item *it, item *new_it);

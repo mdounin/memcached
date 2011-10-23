@@ -190,6 +190,7 @@ static enum test_return test_safe_strtoul(void) {
     assert(val == 123);
     assert(!safe_strtoul("", &val));  // empty
     assert(!safe_strtoul("123BOGUS", &val));  // non-numeric
+    assert(!safe_strtoul(" issue221", &val));  // non-numeric
     /* Not sure what it does, but this works with ICC :/
        assert(!safe_strtoul("92837498237498237498029383", &val)); // out of range
     */
@@ -214,6 +215,7 @@ static enum test_return test_safe_strtoull(void) {
     assert(!safe_strtoull("", &val));  // empty
     assert(!safe_strtoull("123BOGUS", &val));  // non-numeric
     assert(!safe_strtoull("92837498237498237498029383", &val)); // out of range
+    assert(!safe_strtoull(" issue221", &val));  // non-numeric
 
     // extremes:
     assert(safe_strtoull("18446744073709551615", &val)); // 2**64 - 1
@@ -234,6 +236,7 @@ static enum test_return test_safe_strtoll(void) {
     assert(!safe_strtoll("", &val));  // empty
     assert(!safe_strtoll("123BOGUS", &val));  // non-numeric
     assert(!safe_strtoll("92837498237498237498029383", &val)); // out of range
+    assert(!safe_strtoll(" issue221", &val));  // non-numeric
 
     // extremes:
     assert(!safe_strtoll("18446744073709551615", &val)); // 2**64 - 1
@@ -262,6 +265,7 @@ static enum test_return test_safe_strtol(void) {
     assert(!safe_strtol("", &val));  // empty
     assert(!safe_strtol("123BOGUS", &val));  // non-numeric
     assert(!safe_strtol("92837498237498237498029383", &val)); // out of range
+    assert(!safe_strtol(" issue221", &val));  // non-numeric
 
     // extremes:
     /* This actually works on 64-bit ubuntu
@@ -823,6 +827,33 @@ static off_t flush_command(char* buf, size_t bufsz, uint8_t cmd, uint32_t exptim
     return size;
 }
 
+
+static off_t touch_command(char* buf,
+                           size_t bufsz,
+                           uint8_t cmd,
+                           const void* key,
+                           size_t keylen,
+                           uint32_t exptime) {
+    protocol_binary_request_touch *request = (void*)buf;
+    assert(bufsz > sizeof(*request));
+
+    memset(request, 0, sizeof(*request));
+    request->message.header.request.magic = PROTOCOL_BINARY_REQ;
+    request->message.header.request.opcode = cmd;
+
+    request->message.header.request.keylen = htons(keylen);
+    request->message.header.request.extlen = 4;
+    request->message.body.expiration = htonl(exptime);
+    request->message.header.request.bodylen = htonl(keylen + 4);
+
+    request->message.header.request.opaque = 0xdeadbeef;
+
+    off_t key_offset = sizeof(protocol_binary_request_no_extras) + 4;
+
+    memcpy(buf + key_offset, key, keylen);
+    return sizeof(protocol_binary_request_no_extras) + 4 + keylen;
+}
+
 static off_t arithmetic_command(char* buf,
                                 size_t bufsz,
                                 uint8_t cmd,
@@ -940,7 +971,8 @@ static void validate_response_header(protocol_binary_response_no_extras *respons
     } else {
         assert(response->message.header.response.cas == 0);
         assert(response->message.header.response.extlen == 0);
-        if (cmd != PROTOCOL_BINARY_CMD_GETK) {
+        if (cmd != PROTOCOL_BINARY_CMD_GETK &&
+            cmd != PROTOCOL_BINARY_CMD_GATK) {
             assert(response->message.header.response.keylen == 0);
         }
     }
@@ -1570,7 +1602,7 @@ static enum test_return test_binary_stat(void) {
 }
 
 static enum test_return test_binary_illegal(void) {
-    uint8_t cmd = 0x23;
+    uint8_t cmd = 0x25;
     while (cmd != 0x00) {
         union {
             protocol_binary_request_no_extras request;
@@ -1672,6 +1704,15 @@ static enum test_return test_binary_pipeline_hickup_chunk(void *buffer, size_t b
         case PROTOCOL_BINARY_CMD_GETQ:
             len = raw_command(command.bytes, sizeof(command.bytes), cmd,
                              key, keylen, NULL, 0);
+            break;
+
+        case PROTOCOL_BINARY_CMD_TOUCH:
+        case PROTOCOL_BINARY_CMD_GAT:
+        case PROTOCOL_BINARY_CMD_GATQ:
+        case PROTOCOL_BINARY_CMD_GATK:
+        case PROTOCOL_BINARY_CMD_GATKQ:
+            len = touch_command(command.bytes, sizeof(command.bytes), cmd,
+                                key, keylen, 10);
             break;
 
         case PROTOCOL_BINARY_CMD_STAT:

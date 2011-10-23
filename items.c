@@ -26,12 +26,14 @@ static void item_unlink_q(item *it);
 
 #define LARGEST_ID POWER_LARGEST
 typedef struct {
-    unsigned int evicted;
-    unsigned int evicted_nonzero;
+    uint64_t evicted;
+    uint64_t evicted_nonzero;
     rel_time_t evicted_time;
-    unsigned int reclaimed;
-    unsigned int outofmemory;
-    unsigned int tailrepairs;
+    uint64_t reclaimed;
+    uint64_t outofmemory;
+    uint64_t tailrepairs;
+    uint64_t expired_unfetched;
+    uint64_t evicted_unfetched;
 } itemstats_t;
 
 static item *heads[LARGEST_ID];
@@ -115,6 +117,12 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
             stats.reclaimed++;
             STATS_UNLOCK();
             itemstats[id].reclaimed++;
+            if ((it->it_flags & ITEM_FETCHED) == 0) {
+                STATS_LOCK();
+                stats.expired_unfetched++;
+                STATS_UNLOCK();
+                itemstats[id].expired_unfetched++;
+            }
             it->refcount = 1;
             slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
             do_item_unlink(it);
@@ -160,6 +168,12 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
                     itemstats[id].evicted_time = current_time - search->time;
                     if (search->exptime != 0)
                         itemstats[id].evicted_nonzero++;
+                    if ((search->it_flags & ITEM_FETCHED) == 0) {
+                        STATS_LOCK();
+                        stats.evicted_unfetched++;
+                        STATS_UNLOCK();
+                        itemstats[id].evicted_unfetched++;
+                    }
                     STATS_LOCK();
                     stats.evictions++;
                     STATS_UNLOCK();
@@ -171,6 +185,12 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
                     STATS_LOCK();
                     stats.reclaimed++;
                     STATS_UNLOCK();
+                    if ((search->it_flags & ITEM_FETCHED) == 0) {
+                        STATS_LOCK();
+                        stats.expired_unfetched++;
+                        STATS_UNLOCK();
+                        itemstats[id].expired_unfetched++;
+                    }
                 }
                 do_item_unlink(search);
                 break;
@@ -440,17 +460,21 @@ void do_item_stats(ADD_STAT add_stats, void *c) {
             APPEND_NUM_FMT_STAT(fmt, i, "number", "%u", sizes[i]);
             APPEND_NUM_FMT_STAT(fmt, i, "age", "%u", tails[i]->time);
             APPEND_NUM_FMT_STAT(fmt, i, "evicted",
-                                "%u", itemstats[i].evicted);
+                                "%llu", (unsigned long long)itemstats[i].evicted);
             APPEND_NUM_FMT_STAT(fmt, i, "evicted_nonzero",
-                                "%u", itemstats[i].evicted_nonzero);
+                                "%llu", (unsigned long long)itemstats[i].evicted_nonzero);
             APPEND_NUM_FMT_STAT(fmt, i, "evicted_time",
                                 "%u", itemstats[i].evicted_time);
             APPEND_NUM_FMT_STAT(fmt, i, "outofmemory",
-                                "%u", itemstats[i].outofmemory);
+                                "%llu", (unsigned long long)itemstats[i].outofmemory);
             APPEND_NUM_FMT_STAT(fmt, i, "tailrepairs",
-                                "%u", itemstats[i].tailrepairs);;
+                                "%llu", (unsigned long long)itemstats[i].tailrepairs);
             APPEND_NUM_FMT_STAT(fmt, i, "reclaimed",
-                                "%u", itemstats[i].reclaimed);;
+                                "%llu", (unsigned long long)itemstats[i].reclaimed);
+            APPEND_NUM_FMT_STAT(fmt, i, "expired_unfetched",
+                                "%llu", (unsigned long long)itemstats[i].expired_unfetched);
+            APPEND_NUM_FMT_STAT(fmt, i, "evicted_unfetched",
+                                "%llu", (unsigned long long)itemstats[i].evicted_unfetched);
         }
     }
 
@@ -531,12 +555,21 @@ item *do_item_get(const char *key, const size_t nkey) {
 
     if (it != NULL) {
         it->refcount++;
+        it->it_flags |= ITEM_FETCHED;
         DEBUG_REFCNT(it, '+');
     }
 
     if (settings.verbose > 2)
         fprintf(stderr, "\n");
 
+    return it;
+}
+
+item *do_item_touch(const char *key, size_t nkey, uint32_t exptime) {
+    item *it = do_item_get(key, nkey);
+    if (it != NULL) {
+        it->exptime = exptime;
+    }
     return it;
 }
 
