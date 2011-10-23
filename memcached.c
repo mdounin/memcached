@@ -3008,6 +3008,11 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
         c->thread->stats.slab_stats[it->slabs_clsid].touch_hits++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
+#ifdef USE_REPLICATION
+        if (c != rep_conn)
+            replication_call_rep(ITEM_key(it), it->nkey);
+#endif /* USE_REPLICATION */
+
         out_string(c, "TOUCHED");
         item_remove(it);
     } else {
