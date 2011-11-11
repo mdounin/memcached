@@ -2293,9 +2293,9 @@ static void complete_nread(conn *c) {
  *
  * Returns the state of storage.
  */
-enum store_item_type do_store_item(item *it, int comm, conn *c) {
+enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t hv) {
     char *key = ITEM_key(it);
-    item *old_it = do_item_get(key, it->nkey);
+    item *old_it = do_item_get(key, it->nkey, hv);
     enum store_item_type stored = NOT_STORED;
 
     item *new_it = NULL;
@@ -2325,7 +2325,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c) {
             c->thread->stats.slab_stats[old_it->slabs_clsid].cas_hits++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
 
-            item_replace(old_it, it);
+            item_replace(old_it, it, hv);
             stored = STORED;
         } else {
             pthread_mutex_lock(&c->thread->stats.mutex);
@@ -2361,7 +2361,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c) {
 
                 flags = (int) strtol(ITEM_suffix(old_it), (char **) NULL, 10);
 
-                new_it = do_item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */);
+                new_it = item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */);
 
                 if (new_it == NULL) {
                     /* SERVER_ERROR out of memory */
@@ -2388,9 +2388,9 @@ enum store_item_type do_store_item(item *it, int comm, conn *c) {
 
         if (stored == NOT_STORED) {
             if (old_it != NULL)
-                item_replace(old_it, it);
+                item_replace(old_it, it, hv);
             else
-                do_item_link(it);
+                do_item_link(it, hv);
 
             c->cas = ITEM_get_cas(it);
 
@@ -2441,28 +2441,34 @@ typedef struct token_s {
 static size_t tokenize_command(char *command, token_t *tokens, const size_t max_tokens) {
     char *s, *e;
     size_t ntokens = 0;
+    size_t len = strlen(command);
+    unsigned int i = 0;
 
     assert(command != NULL && tokens != NULL && max_tokens > 1);
 
-    for (s = e = command; ntokens < max_tokens - 1; ++e) {
+    s = e = command;
+    for (i = 0; i < len; i++) {
         if (*e == ' ') {
             if (s != e) {
                 tokens[ntokens].value = s;
                 tokens[ntokens].length = e - s;
                 ntokens++;
                 *e = '\0';
+                if (ntokens == max_tokens - 1) {
+                    e++;
+                    s = e; /* so we don't add an extra token */
+                    break;
+                }
             }
             s = e + 1;
         }
-        else if (*e == '\0') {
-            if (s != e) {
-                tokens[ntokens].value = s;
-                tokens[ntokens].length = e - s;
-                ntokens++;
-            }
+        e++;
+    }
 
-            break; /* string end */
-        }
+    if (s != e) {
+        tokens[ntokens].value = s;
+        tokens[ntokens].length = e - s;
+        ntokens++;
     }
 
     /*
@@ -3087,13 +3093,14 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
  */
 enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
                                     const bool incr, const int64_t delta,
-                                    char *buf, uint64_t *cas) {
+                                    char *buf, uint64_t *cas,
+                                    const uint32_t hv) {
     char *ptr;
     uint64_t value;
     int res;
     item *it;
 
-    it = do_item_get(key, nkey);
+    it = do_item_get(key, nkey, hv);
     if (!it) {
         return DELTA_ITEM_NOT_FOUND;
     }
@@ -3134,14 +3141,14 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     res = strlen(buf);
     if (res + 2 > it->nbytes || it->refcount != 1) { /* need to realloc */
         item *new_it;
-        new_it = do_item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2 );
+        new_it = item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2 );
         if (new_it == 0) {
             do_item_remove(it);
             return EOM;
         }
         memcpy(ITEM_data(new_it), buf, res);
         memcpy(ITEM_data(new_it) + res, "\r\n", 2);
-        item_replace(it, new_it);
+        item_replace(it, new_it, hv);
         // Overwrite the older item's CAS with our new CAS since we're
         // returning the CAS of the old item below.
         ITEM_set_cas(it, (settings.use_cas) ? ITEM_get_cas(new_it) : 0);
@@ -3149,7 +3156,9 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     } else { /* replace in-place */
         /* When changing the value without replacing the item, we
            need to update the CAS on the existing item. */
+        mutex_lock(&cache_lock); /* FIXME */
         ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
+        pthread_mutex_unlock(&cache_lock);
 
         memcpy(ITEM_data(it), buf, res);
         memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);

@@ -42,7 +42,7 @@ static itemstats_t itemstats[LARGEST_ID];
 static unsigned int sizes[LARGEST_ID];
 
 void item_stats_reset(void) {
-    pthread_mutex_lock(&cache_lock);
+    mutex_lock(&cache_lock);
     memset(itemstats, 0, sizeof(itemstats));
     pthread_mutex_unlock(&cache_lock);
 }
@@ -98,128 +98,89 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
     if (id == 0)
         return 0;
 
+    mutex_lock(&cache_lock);
     /* do a quick check if we have any expired items in the tail.. */
-    int tries = 50;
     item *search;
     rel_time_t oldest_live = settings.oldest_live;
 
-    for (search = tails[id];
-         tries > 0 && search != NULL;
-         tries--, search=search->prev) {
-        if (search->refcount == 0 &&
-            ((search->time < oldest_live) || // dead by flush
-             (search->exptime != 0 && search->exptime < current_time))) {
-            it = search;
-            /* I don't want to actually free the object, just steal
-             * the item to avoid to grab the slab mutex twice ;-)
-             */
+    search = tails[id];
+    if (search == NULL) {
+        it = slabs_alloc(ntotal, id);
+    } else if (search->refcount == 0) {
+        if ((search->time < oldest_live) || // dead by flush
+         (search->exptime != 0 && search->exptime < current_time)) {
             STATS_LOCK();
             stats.reclaimed++;
             STATS_UNLOCK();
             itemstats[id].reclaimed++;
-            if ((it->it_flags & ITEM_FETCHED) == 0) {
+            if ((search->it_flags & ITEM_FETCHED) == 0) {
                 STATS_LOCK();
                 stats.expired_unfetched++;
                 STATS_UNLOCK();
                 itemstats[id].expired_unfetched++;
             }
+            it = search;
             it->refcount = 1;
             slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
-            do_item_unlink(it);
+            do_item_unlink_nolock(it, hash(ITEM_key(it), it->nkey, 0));
             /* Initialize the item block: */
             it->slabs_clsid = 0;
             it->refcount = 0;
-            break;
         }
     }
 
     if (it == NULL && (it = slabs_alloc(ntotal, id)) == NULL) {
-        /*
-        ** Could not find an expired item at the tail, and memory allocation
-        ** failed. Try to evict some items!
-        */
-        tries = 50;
-
-        /* If requested to not push old items out of cache when memory runs out,
-         * we're out of luck at this point...
-         */
-
-        if (settings.evict_to_free == 0) {
-            itemstats[id].outofmemory++;
-            return NULL;
-        }
-
-        /*
-         * try to get one off the right LRU
-         * don't necessariuly unlink the tail because it may be locked: refcount>0
-         * search up from tail an item with refcount==0 and unlink it; give up after 50
-         * tries
-         */
-
-        if (tails[id] == 0) {
-            itemstats[id].outofmemory++;
-            return NULL;
-        }
-
-        for (search = tails[id]; tries > 0 && search != NULL; tries--, search=search->prev) {
-            if (search->refcount == 0) {
-                if (search->exptime == 0 || search->exptime > current_time) {
-                    itemstats[id].evicted++;
-                    itemstats[id].evicted_time = current_time - search->time;
-                    if (search->exptime != 0)
-                        itemstats[id].evicted_nonzero++;
-                    if ((search->it_flags & ITEM_FETCHED) == 0) {
-                        STATS_LOCK();
-                        stats.evicted_unfetched++;
-                        STATS_UNLOCK();
-                        itemstats[id].evicted_unfetched++;
-                    }
-                    STATS_LOCK();
-                    stats.evictions++;
-                    STATS_UNLOCK();
-#ifdef USE_REPLICATION
-                    replication_call_del(ITEM_key(search), search->nkey);
-#endif /* USE_REPLICATION */
-                } else {
-                    itemstats[id].reclaimed++;
-                    STATS_LOCK();
-                    stats.reclaimed++;
-                    STATS_UNLOCK();
-                    if ((search->it_flags & ITEM_FETCHED) == 0) {
-                        STATS_LOCK();
-                        stats.expired_unfetched++;
-                        STATS_UNLOCK();
-                        itemstats[id].expired_unfetched++;
-                    }
-                }
-                do_item_unlink(search);
-                break;
-            }
-        }
-        it = slabs_alloc(ntotal, id);
-        if (it == 0) {
-            itemstats[id].outofmemory++;
-            /* Last ditch effort. There is a very rare bug which causes
-             * refcount leaks. We've fixed most of them, but it still happens,
-             * and it may happen in the future.
-             * We can reasonably assume no item can stay locked for more than
-             * three hours, so if we find one in the tail which is that old,
-             * free it anyway.
-             */
-            tries = 50;
-            for (search = tails[id]; tries > 0 && search != NULL; tries--, search=search->prev) {
-                if (search->refcount != 0 && search->time + TAIL_REPAIR_TIME < current_time) {
-                    itemstats[id].tailrepairs++;
-                    search->refcount = 0;
-                    do_item_unlink(search);
-                    break;
-                }
-            }
-            it = slabs_alloc(ntotal, id);
-            if (it == 0) {
+        if (search->refcount == 0 &&
+            (search->exptime == 0 || search->exptime > current_time)) {
+            if (settings.evict_to_free == 0) {
+                itemstats[id].outofmemory++;
+                pthread_mutex_unlock(&cache_lock);
                 return NULL;
             }
+            itemstats[id].evicted++;
+            itemstats[id].evicted_time = current_time - search->time;
+            if (search->exptime != 0)
+                itemstats[id].evicted_nonzero++;
+            if ((search->it_flags & ITEM_FETCHED) == 0) {
+                STATS_LOCK();
+                stats.evicted_unfetched++;
+                STATS_UNLOCK();
+                itemstats[id].evicted_unfetched++;
+            }
+            STATS_LOCK();
+            stats.evictions++;
+            STATS_UNLOCK();
+#ifdef USE_REPLICATION
+            replication_call_del(ITEM_key(search), search->nkey);
+#endif /* USE_REPLICATION */
+            it = search;
+            it->refcount = 1;
+            slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
+            do_item_unlink_nolock(it, hash(ITEM_key(it), it->nkey, 0));
+            /* Initialize the item block: */
+            it->slabs_clsid = 0;
+            it->refcount = 0;
         }
+    }
+
+    if (it == NULL) {
+        itemstats[id].outofmemory++;
+        /* Last ditch effort. There is a very rare bug which causes
+         * refcount leaks. We've fixed most of them, but it still happens,
+         * and it may happen in the future.
+         * We can reasonably assume no item can stay locked for more than
+         * three hours, so if we find one in the tail which is that old,
+         * free it anyway.
+         */
+        if (search != NULL &&
+            search->refcount != 0 &&
+            search->time + TAIL_REPAIR_TIME < current_time) {
+            itemstats[id].tailrepairs++;
+            search->refcount = 0;
+            do_item_unlink_nolock(search, hash(ITEM_key(search), search->nkey, 0));
+        }
+        pthread_mutex_unlock(&cache_lock);
+        return NULL;
     }
 
     assert(it->slabs_clsid == 0);
@@ -238,6 +199,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
     it->exptime = exptime;
     memcpy(ITEM_suffix(it), suffix, (size_t)nsuffix);
     it->nsuffix = nsuffix;
+    pthread_mutex_unlock(&cache_lock);
     return it;
 }
 
@@ -315,12 +277,11 @@ static void item_unlink_q(item *it) {
     return;
 }
 
-int do_item_link(item *it) {
+int do_item_link(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
     it->it_flags |= ITEM_LINKED;
     it->time = current_time;
-    assoc_insert(it);
 
     STATS_LOCK();
     stats.curr_bytes += ITEM_ntotal(it);
@@ -328,6 +289,7 @@ int do_item_link(item *it) {
     stats.total_items += 1;
     STATS_UNLOCK();
 
+    mutex_lock(&cache_lock);
 #ifdef USE_REPLICATION
     /* Allocate a new CAS ID on link. */
     if(!(it->it_flags & ITEM_REPDATA))
@@ -336,13 +298,14 @@ int do_item_link(item *it) {
     /* Allocate a new CAS ID on link. */
     ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
 #endif /* USE_REPLICATION */
-
+    assoc_insert(it, hv);
     item_link_q(it);
+    pthread_mutex_unlock(&cache_lock);
 
     return 1;
 }
 
-void do_item_unlink(item *it) {
+void do_item_unlink(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
     if ((it->it_flags & ITEM_LINKED) != 0) {
         it->it_flags &= ~ITEM_LINKED;
@@ -350,7 +313,24 @@ void do_item_unlink(item *it) {
         stats.curr_bytes -= ITEM_ntotal(it);
         stats.curr_items -= 1;
         STATS_UNLOCK();
-        assoc_delete(ITEM_key(it), it->nkey);
+        mutex_lock(&cache_lock);
+        assoc_delete(ITEM_key(it), it->nkey, hv);
+        item_unlink_q(it);
+        pthread_mutex_unlock(&cache_lock);
+        if (it->refcount == 0) item_free(it);
+    }
+}
+
+/* FIXME: Is it necessary to keep thsi copy/pasted code? */
+void do_item_unlink_nolock(item *it, const uint32_t hv) {
+    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+    if ((it->it_flags & ITEM_LINKED) != 0) {
+        it->it_flags &= ~ITEM_LINKED;
+        STATS_LOCK();
+        stats.curr_bytes -= ITEM_ntotal(it);
+        stats.curr_items -= 1;
+        STATS_UNLOCK();
+        assoc_delete(ITEM_key(it), it->nkey, hv);
         item_unlink_q(it);
         if (it->refcount == 0) item_free(it);
     }
@@ -374,20 +354,22 @@ void do_item_update(item *it) {
         assert((it->it_flags & ITEM_SLABBED) == 0);
 
         if ((it->it_flags & ITEM_LINKED) != 0) {
+            mutex_lock(&cache_lock);
             item_unlink_q(it);
             it->time = current_time;
             item_link_q(it);
+            pthread_mutex_unlock(&cache_lock);
         }
     }
 }
 
-int do_item_replace(item *it, item *new_it) {
+int do_item_replace(item *it, item *new_it, const uint32_t hv) {
     MEMCACHED_ITEM_REPLACE(ITEM_key(it), it->nkey, it->nbytes,
                            ITEM_key(new_it), new_it->nkey, new_it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
 
-    do_item_unlink(it);
-    return do_item_link(new_it);
+    do_item_unlink(it, hv);
+    return do_item_link(new_it, hv);
 }
 
 /*@null@*/
@@ -438,21 +420,6 @@ void do_item_stats(ADD_STAT add_stats, void *c) {
             char key_str[STAT_KEY_LEN];
             char val_str[STAT_VAL_LEN];
             int klen = 0, vlen = 0;
-            int search = 50;
-            while (search > 0 &&
-                   tails[i] != NULL &&
-                   ((settings.oldest_live != 0 && /* Item flushd */
-                     settings.oldest_live <= current_time &&
-                     tails[i]->time <= settings.oldest_live) ||
-                    (tails[i]->exptime != 0 && /* and not expired */
-                     tails[i]->exptime < current_time))) {
-                --search;
-                if (tails[i]->refcount == 0) {
-                    do_item_unlink(tails[i]);
-                } else {
-                    break;
-                }
-            }
             if (tails[i] == NULL) {
                 /* We removed all of the items in this slab class */
                 continue;
@@ -519,8 +486,10 @@ void do_item_stats_sizes(ADD_STAT add_stats, void *c) {
 }
 
 /** wrapper around assoc_find which does the lazy expiration logic */
-item *do_item_get(const char *key, const size_t nkey) {
-    item *it = assoc_find(key, nkey);
+item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
+    mutex_lock(&cache_lock);
+    item *it = assoc_find(key, nkey, hv);
+    pthread_mutex_unlock(&cache_lock);
     int was_found = 0;
 
     if (settings.verbose > 2) {
@@ -534,7 +503,7 @@ item *do_item_get(const char *key, const size_t nkey) {
 
     if (it != NULL && settings.oldest_live != 0 && settings.oldest_live <= current_time &&
         it->time <= settings.oldest_live) {
-        do_item_unlink(it);           /* MTSAFE - cache_lock held */
+        do_item_unlink(it, hv);           /* MTSAFE - item_lock held */
         it = NULL;
     }
 
@@ -544,7 +513,7 @@ item *do_item_get(const char *key, const size_t nkey) {
     }
 
     if (it != NULL && it->exptime != 0 && it->exptime <= current_time) {
-        do_item_unlink(it);           /* MTSAFE - cache_lock held */
+        do_item_unlink(it, hv);           /* MTSAFE - item_lock held */
         it = NULL;
     }
 
@@ -565,20 +534,11 @@ item *do_item_get(const char *key, const size_t nkey) {
     return it;
 }
 
-item *do_item_touch(const char *key, size_t nkey, uint32_t exptime) {
-    item *it = do_item_get(key, nkey);
+item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
+                    const uint32_t hv) {
+    item *it = do_item_get(key, nkey, hv);
     if (it != NULL) {
         it->exptime = exptime;
-    }
-    return it;
-}
-
-/** returns an item whether or not it's expired. */
-item *do_item_get_nocheck(const char *key, const size_t nkey) {
-    item *it = assoc_find(key, nkey);
-    if (it) {
-        it->refcount++;
-        DEBUG_REFCNT(it, '+');
     }
     return it;
 }
@@ -599,7 +559,7 @@ void do_item_flush_expired(void) {
             if (iter->time >= settings.oldest_live) {
                 next = iter->next;
                 if ((iter->it_flags & ITEM_SLABBED) == 0) {
-                    do_item_unlink(iter);
+                    do_item_unlink_nolock(iter, hash(ITEM_key(iter), iter->nkey, 0));
                 }
             } else {
                 /* We've hit the first old item. Continue to the next queue. */
