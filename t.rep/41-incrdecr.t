@@ -30,15 +30,18 @@ for my $sock ([$sock_m1, $sock_m2], [$sock_m2, $sock_m1]) {
 
     print $sock_m "decr num 1\r\n";
     is(scalar <$sock_m>, "9\r\n", "- 1 = 9");
-    sync_get_is($sock_m, $sock_b, "num", '9 ');
+    #sync_get_is($sock_m, $sock_b, "num", '9 ');
+    sync_get_is($sock_m, $sock_b, "num", '9');
 
     print $sock_m "decr num 9\r\n";
     is(scalar <$sock_m>, "0\r\n", "- 9 = 0");
-    sync_get_is($sock_m, $sock_b, "num", '0 ');
+    #sync_get_is($sock_m, $sock_b, "num", '0 ');
+    sync_get_is($sock_m, $sock_b, "num", '0');
 
     print $sock_m "decr num 5\r\n";
     is(scalar <$sock_m>, "0\r\n", "- 5 = 0");
-    sync_get_is($sock_m, $sock_b, "num", '0 ');
+    #sync_get_is($sock_m, $sock_b, "num", '0 ');
+    sync_get_is($sock_m, $sock_b, "num", '0');
 
     printf $sock_m "set num 0 0 10\r\n4294967296\r\n";
     is(scalar <$sock_m>, "STORED\r\n", "stored 2**32");
@@ -54,7 +57,8 @@ for my $sock ([$sock_m1, $sock_m2], [$sock_m2, $sock_m1]) {
 
         print $sock_m "incr num 1\r\n";
         is(scalar <$sock_m>, "0\r\n", "(2**64 - 1) + 1 = 0");
-        sync_get_is($sock_m, $sock_b, "num", sprintf('%-20s','0'));
+        #sync_get_is($sock_m, $sock_b, "num", sprintf('%-20s','0'));
+        sync_get_is($sock_m, $sock_b, "num", '0');
     }
 
     print $sock_m "decr bogus 5\r\n";

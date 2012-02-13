@@ -125,6 +125,9 @@ struct stats stats;
 struct settings settings;
 time_t process_started;     /* when the process was started */
 
+struct slab_rebalance slab_rebal;
+volatile int slab_rebalance_signal;
+
 /** file scope variables **/
 static conn *listen_conn = NULL;
 static struct event_base *main_base;
@@ -193,7 +196,9 @@ static void stats_init(void) {
     stats.curr_bytes = stats.listen_disabled_num = 0;
     stats.hash_power_level = stats.hash_bytes = stats.hash_is_expanding = 0;
     stats.expired_unfetched = stats.evicted_unfetched = 0;
+    stats.slabs_moved = 0;
     stats.accepting_conns = true; /* assuming we start in this state. */
+    stats.slab_reassign_running = false;
 
     /* make the time we started always be 2 seconds before we really
        did, so time(0) - time.started is never zero.  if so, things
@@ -246,6 +251,8 @@ static void settings_init(void) {
     settings.rep_port = 11212;
     settings.rep_qmax = 8192;
 #endif /* USE_REPLICATION */
+    settings.slab_reassign = false;
+    settings.slab_automove = false;
 }
 
 /*
@@ -1648,7 +1655,9 @@ static void init_sasl_conn(conn *c) {
 
     if (!c->sasl_conn) {
         int result=sasl_server_new("memcached",
-                                   NULL, NULL, NULL, NULL,
+                                   NULL,
+                                   my_sasl_hostname[0] ? my_sasl_hostname : NULL,
+                                   NULL, NULL,
                                    NULL, 0, &c->sasl_conn);
         if (result != SASL_OK) {
             if (settings.verbose) {
@@ -2203,6 +2212,9 @@ static void process_bin_delete(conn *c) {
         uint64_t cas = ntohll(req->message.header.request.cas);
         if (cas == 0 || cas == ITEM_get_cas(it)) {
             MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.slab_stats[it->slabs_clsid].delete_hits++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
             item_unlink(it);
             write_bin_response(c, NULL, 0, 0, 0);
         } else {
@@ -2211,6 +2223,9 @@ static void process_bin_delete(conn *c) {
         item_remove(it);      /* release our reference */
     } else {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, 0);
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        c->thread->stats.delete_misses++;
+        pthread_mutex_unlock(&c->thread->stats.mutex);
     }
 }
 
@@ -2628,6 +2643,10 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("repcached_version", "%s", REPCACHED_VERSION);
     APPEND_STAT("repcached_qi_free", "%u", settings.rep_qmax - get_qi_count());
 #endif /*USE_REPLICATION*/
+    if (settings.slab_reassign) {
+        APPEND_STAT("slab_reassign_running", "%u", stats.slab_reassign_running);
+        APPEND_STAT("slabs_moved", "%llu", stats.slabs_moved);
+    }
     STATS_UNLOCK();
 }
 
@@ -2660,6 +2679,8 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("item_size_max", "%d", settings.item_size_max);
     APPEND_STAT("maxconns_fast", "%s", settings.maxconns_fast ? "yes" : "no");
     APPEND_STAT("hashpower_init", "%d", settings.hashpower_init);
+    APPEND_STAT("slab_reassign", "%s", settings.slab_reassign ? "yes" : "no");
+    APPEND_STAT("slab_automove", "%s", settings.slab_automove ? "yes" : "no");
 }
 
 static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
@@ -3251,6 +3272,26 @@ static void process_verbosity_command(conn *c, token_t *tokens, const size_t nto
     return;
 }
 
+static void process_slabs_automove_command(conn *c, token_t *tokens, const size_t ntokens) {
+    unsigned int level;
+
+    assert(c != NULL);
+
+    set_noreply_maybe(c, tokens, ntokens);
+
+    level = strtoul(tokens[2].value, NULL, 10);
+    if (level == 0) {
+        settings.slab_automove = false;
+    } else if (level == 1) {
+        settings.slab_automove = true;
+    } else {
+        out_string(c, "ERROR");
+        return;
+    }
+    out_string(c, "OK");
+    return;
+}
+
 static void process_command(conn *c, char *command) {
 
     token_t tokens[MAX_TOKENS];
@@ -3392,6 +3433,54 @@ static void process_command(conn *c, char *command) {
 
         conn_set_state(c, conn_closing);
 
+    } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "slabs") == 0) {
+        if (ntokens == 5 && strcmp(tokens[COMMAND_TOKEN + 1].value, "reassign") == 0) {
+            int src, dst, rv;
+
+            if (settings.slab_reassign == false) {
+                out_string(c, "CLIENT_ERROR slab reassignment disabled");
+                return;
+            }
+
+            src = strtol(tokens[2].value, NULL, 10);
+            dst = strtol(tokens[3].value, NULL, 10);
+
+            if (errno == ERANGE) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
+
+            rv = slabs_reassign(src, dst);
+            switch (rv) {
+            case REASSIGN_OK:
+                out_string(c, "OK");
+                break;
+            case REASSIGN_RUNNING:
+                out_string(c, "BUSY currently processing reassign request");
+                break;
+            case REASSIGN_BADCLASS:
+                out_string(c, "BADCLASS invalid src or dst class id");
+                break;
+            case REASSIGN_NOSPARE:
+                out_string(c, "NOSPARE source class has no spare pages");
+                break;
+            case REASSIGN_DEST_NOT_FULL:
+                out_string(c, "NOTFULL dest class has spare memory");
+                break;
+            case REASSIGN_SRC_NOT_SAFE:
+                out_string(c, "UNSAFE src class is in an unsafe state");
+                break;
+            case REASSIGN_SRC_DST_SAME:
+                out_string(c, "SAME src and dst class are identical");
+                break;
+            }
+            return;
+        } else if (ntokens == 4 &&
+            (strcmp(tokens[COMMAND_TOKEN + 1].value, "automove") == 0)) {
+            process_slabs_automove_command(c, tokens, ntokens);
+        } else {
+            out_string(c, "ERROR");
+        }
     } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "verbosity") == 0)) {
         process_verbosity_command(c, tokens, ntokens);
     } else {
@@ -4998,11 +5087,15 @@ int main (int argc, char **argv) {
     char *subopts_value;
     enum {
         MAXCONNS_FAST = 0,
-        HASHPOWER_INIT
+        HASHPOWER_INIT,
+        SLAB_REASSIGN,
+        SLAB_AUTOMOVE
     };
     char *const subopts_tokens[] = {
         [MAXCONNS_FAST] = "maxconns_fast",
         [HASHPOWER_INIT] = "hashpower",
+        [SLAB_REASSIGN] = "slab_reassign",
+        [SLAB_AUTOMOVE] = "slab_automove",
         NULL
     };
 
@@ -5278,6 +5371,12 @@ int main (int argc, char **argv) {
                     return 1;
                 }
                 break;
+            case SLAB_REASSIGN:
+                settings.slab_reassign = true;
+                break;
+            case SLAB_AUTOMOVE:
+                settings.slab_automove = true;
+                break;
             default:
                 printf("Illegal suboption \"%s\"\n", subopts_value);
                 return 1;
@@ -5439,6 +5538,11 @@ int main (int argc, char **argv) {
     thread_init(settings.num_threads, main_base);
 
     if (start_assoc_maintenance_thread() == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    if (settings.slab_reassign &&
+        start_slab_maintenance_thread() == -1) {
         exit(EXIT_FAILURE);
     }
 

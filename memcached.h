@@ -271,6 +271,8 @@ struct stats {
     bool          hash_is_expanding; /* If the hash table is being expanded */
     uint64_t      expired_unfetched; /* items reclaimed but never touched */
     uint64_t      evicted_unfetched; /* items evicted but never touched */
+    bool          slab_reassign_running; /* slab reassign in progress */
+    uint64_t      slabs_moved;       /* times slabs were moved around */
 };
 
 #define MAX_VERBOSITY_LEVEL 2
@@ -304,6 +306,8 @@ struct settings {
     int item_size_max;        /* Maximum item size, and upper end for slabs */
     bool sasl;              /* SASL on/off */
     bool maxconns_fast;     /* Whether or not to early close connections */
+    bool slab_reassign;     /* Whether or not slab reassignment is allowed */
+    bool slab_automove;     /* Whether or not to automatically move slabs */
     int hashpower_init;     /* Starting hash power level */
 #ifdef USE_REPLICATION
     struct in_addr rep_addr;    /* replication addr */
@@ -467,6 +471,21 @@ struct conn {
 /* current time of day (updated periodically) */
 extern volatile rel_time_t current_time;
 
+/* TODO: Move to slabs.h? */
+extern volatile int slab_rebalance_signal;
+
+struct slab_rebalance {
+    void *slab_start;
+    void *slab_end;
+    void *slab_pos;
+    int s_clsid;
+    int d_clsid;
+    int busy_items;
+    uint8_t done;
+};
+
+extern struct slab_rebalance slab_rebal;
+
 /*
  * Functions
  */
@@ -534,6 +553,8 @@ void  item_update(item *it);
 
 void item_lock(uint32_t hv);
 void item_unlock(uint32_t hv);
+unsigned short refcount_incr(unsigned short *refcount);
+unsigned short refcount_decr(unsigned short *refcount);
 void STATS_LOCK(void);
 void STATS_UNLOCK(void);
 void threadlocal_stats_reset(void);
