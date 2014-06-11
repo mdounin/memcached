@@ -40,10 +40,12 @@ Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd, bool reuse)
 
     if(NULL == q){
         if(reuse) {
+            fprintf(stderr,"replication: reuse is true\n");
             pthread_mutex_unlock(&replication_queue_lock);
             return(NULL);
         }
         if(q_itemcount >= settings.rep_qmax) {
+            fprintf(stderr,"replication: q_itemcount=%d is larger than settings.rep_qmax\n",q_itemcount);
             pthread_mutex_unlock(&replication_queue_lock);
             return(NULL);
         }
@@ -85,6 +87,7 @@ Q_ITEM *qi_new(enum CMD_TYPE type, R_CMD *cmd, bool reuse)
     if (keylen) {
         q->key = malloc(keylen + 1);
         if(NULL == q->key){
+            fprintf(stderr,"replication: q->key out of memory\n");
             qi_free(q);
             q = NULL;
         }else{
